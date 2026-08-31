@@ -273,16 +273,16 @@ To generate charts for your own environment:
 
 ```bash
 sudo ./venv/bin/python3 scripts/generate_charts.py
+```
+Generated charts are stored in the `visualizations/` directory.
 
-Generated charts are stored in:
+> **Privacy note:** Real development visualizations are not included in the public repository because they were generated from local wireless-network observations that may contain identifying SSIDs, BSSIDs, or environment-specific information.
 
-visualizations/
-
-Real development visualizations are not included in the public repository because they were generated from local wireless-network observations that may contain identifying SSIDs, BSSIDs, or environment-specific information.
-
-The sequence-collision chart produced by the current visualization script is illustrative and should not be interpreted as a direct PCAP replay.
+> **Evaluation note:** The sequence-collision chart produced by the current visualization script is illustrative and should not be interpreted as a direct PCAP replay.
 
 Future releases will include sanitized or synthetic example visualizations that can be safely published.
+
+---
 
 ## 📁 Repository Structure
 
