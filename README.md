@@ -260,29 +260,29 @@ The experiment demonstrates detection of a **BSSID-spoofed laboratory transmitte
 
 ## 📈 Visualizations
 
-The project includes visualizations generated from development experiments:
+The project includes a chart-generation script for analyzing locally collected wireless data.
 
-### Clock-Skew Fingerprints
+Available visualizations include:
 
-![Clock Skew Fingerprints](visualizations/1_clock_skew_fingerprints.png)
+- Clock-skew fingerprints
+- Information Element (IE) fingerprints
+- Sequence-collision illustrations
+- Detection-layer weight analysis
 
-### Information Element Fingerprints
+To generate charts for your own environment:
 
-![IE Hardware Fingerprints](visualizations/2_ie_hardware_fingerprints.png)
+```bash
+sudo ./venv/bin/python3 scripts/generate_charts.py
 
-### Sequence Collision Illustration
+Generated charts are stored in:
 
-![Sequence Collision Proof](visualizations/3_sequence_collision_proof.png)
+visualizations/
 
-> The sequence-collision visualization is illustrative and is not a direct PCAP replay.
+Real development visualizations are not included in the public repository because they were generated from local wireless-network observations that may contain identifying SSIDs, BSSIDs, or environment-specific information.
 
-### Detection Layer Weights
+The sequence-collision chart produced by the current visualization script is illustrative and should not be interpreted as a direct PCAP replay.
 
-![Detection Layer Weights](visualizations/4_ai_layer_weights.png)
-
-The current scoring weights are heuristic values developed during prototype calibration and should not be interpreted as calibrated probabilities.
-
----
+Future releases will include sanitized or synthetic example visualizations that can be safely published.
 
 ## 📁 Repository Structure
 
