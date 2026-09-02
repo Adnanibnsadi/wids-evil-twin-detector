@@ -292,15 +292,16 @@ def extract_security(
             element = element.payload
 
 
-        capabilities = int(
+        capabilities = str(
             packet[
                 Dot11Beacon
             ].cap
-        )
+        ).lower()
 
 
-        has_privacy = bool(
-            capabilities & 0x0010
+        has_privacy = (
+             "privacy"
+              in capabilities
         )
 
 
