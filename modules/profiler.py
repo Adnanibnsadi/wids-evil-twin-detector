@@ -1,494 +1,1472 @@
 #!/usr/bin/env python3
 """
 =======================================================
-  profiler.py - Automatic AP Behavior Profiler
+ modules/profiler.py
 =======================================================
-  This module automatically learns what a NORMAL
-  legitimate AP looks like by observing it for
-  a short period of time.
 
-  It builds a "behavioral fingerprint" for each AP
-  that includes:
-  - Signal strength patterns
-  - Sequence number behavior
-  - Clock skew signature
-  - Beacon timing consistency
-  - Information Element fingerprint
+Legacy / experimental single-AP behavioral profiler.
 
-  No manual configuration needed.
-  Works for ANY network anywhere.
+This module belongs to an earlier generation of the
+project in which one selected access point was observed
+for a short period and stored in ap_profiles.json.
+
+The current primary workflow uses:
+
+    scripts/collect_all_aps.py
+        ↓
+    scripts/build_profiles.py
+        ↓
+    data/bssid_profiles.json
+        ↓
+    scripts/build_advanced_model.py
+
+This file is retained for historical experimentation and
+backward compatibility.
+
+The profile values produced here are behavioral and
+structural baselines. They are NOT immutable hardware
+identifiers and should not independently be interpreted
+as proof of an Evil Twin or rogue access point.
 =======================================================
 """
 
-from scapy.all import *
-from scapy.layers.dot11 import Dot11, Dot11Beacon, Dot11Elt, RadioTap
-import pandas as pd
-import numpy as np
 import json
 import os
 import sys
-import time
 import threading
+import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import pandas as pd
+from scapy.all import sniff
+from scapy.layers.dot11 import (
+    Dot11,
+    Dot11Beacon,
+    Dot11Elt,
+    RadioTap,
+)
+
+
+# Allow imports from project root.
+sys.path.insert(
+    0,
+    os.path.dirname(
+        os.path.dirname(
+            os.path.abspath(__file__)
+        )
+    ),
+)
+
 import config
 
-# ─────────────────────────────────────────────────────
-# GLOBAL VARIABLES
-# ─────────────────────────────────────────────────────
-captured_beacons  = []       # Raw beacon data during profiling
-profiling_active  = False    # Is profiling running?
-hop_active        = False    # Is channel hopper running?
-target_ssid       = None     # SSID we are profiling
-target_bssid      = None     # BSSID we are profiling
-target_channel    = None     # Channel to lock on
 
-# Sequence and timestamp tracking
-seq_tracker       = {}
-ts_tracker        = {}
+# =======================================================
+# GLOBAL STATE
+# =======================================================
 
-# ─────────────────────────────────────────────────────
-# FEATURE EXTRACTION (Same as sniffer but standalone)
-# ─────────────────────────────────────────────────────
+captured_beacons = []
 
-def extract_features(packet, system_time):
+hop_active = False
+
+target_ssid = None
+target_bssid = None
+target_channel = None
+
+seq_tracker = {}
+ts_tracker = {}
+
+
+# =======================================================
+# FEATURE EXTRACTION
+# =======================================================
+
+def extract_features(
+    packet,
+    system_time,
+):
     """
-    Extract all features from a single beacon frame.
-    Returns a dictionary of features or None if failed.
+    Extract behavioral and structural characteristics
+    from one 802.11 beacon frame.
+
+    Returns
+    -------
+    dict or None
+        Extracted beacon features.
     """
+
     try:
-        bssid = packet[Dot11].addr2
+
+        bssid = packet[
+            Dot11
+        ].addr2
+
+
+        if not bssid:
+
+            return None
+
+
+        bssid = bssid.lower()
+
+
+        # ------------------------------------------------
+        # SSID
+        # ------------------------------------------------
 
         try:
-            ssid = packet[Dot11Elt].info.decode('utf-8', errors='replace')
-        except Exception:
-            ssid = "unknown"
 
+            ssid = (
+                packet[
+                    Dot11Elt
+                ]
+                .info
+                .decode(
+                    "utf-8",
+                    errors="replace",
+                )
+            )
+
+        except Exception:
+
+            ssid = "<Unknown>"
+
+
+        if not ssid.strip():
+
+            ssid = "<Hidden>"
+
+
+        # ------------------------------------------------
         # RSSI
+        # ------------------------------------------------
+
         rssi = 0
-        try:
-            if packet.haslayer(RadioTap):
-                rssi = packet[RadioTap].dBm_AntSignal
-        except Exception:
-            pass
 
-        # Channel
+
+        if packet.haslayer(
+            RadioTap
+        ):
+
+            try:
+
+                signal = packet[
+                    RadioTap
+                ].dBm_AntSignal
+
+
+                if signal is not None:
+
+                    rssi = signal
+
+            except Exception:
+
+                pass
+
+
+        # ------------------------------------------------
+        # CHANNEL
+        # ------------------------------------------------
+
         channel = 0
-        element = packet[Dot11Elt]
-        while element:
-            if element.ID == 3:
-                channel = ord(element.info)
+
+
+        element = packet[
+            Dot11Elt
+        ]
+
+
+        while isinstance(
+            element,
+            Dot11Elt,
+        ):
+
+            if (
+                element.ID == 3
+                and element.info
+            ):
+
+                channel = element.info[0]
                 break
+
+
             element = element.payload
 
-        # Supported rates
-        rates   = []
-        element = packet[Dot11Elt]
-        while element:
-            if element.ID in [1, 50]:
+
+        # ------------------------------------------------
+        # SUPPORTED RATES
+        # ------------------------------------------------
+
+        rates = []
+
+
+        element = packet[
+            Dot11Elt
+        ]
+
+
+        while isinstance(
+            element,
+            Dot11Elt,
+        ):
+
+            if element.ID in (
+                1,
+                50,
+            ):
+
                 for rate in element.info:
-                    rates.append((rate & 0x7F) * 0.5)
-            element = element.payload
-        supported_rates = ",".join(map(str, sorted(set(rates)))) if rates else "unknown"
 
-        # Security
-        security  = "Open"
-        element   = packet[Dot11Elt]
-        has_rsn   = False
-        has_wpa   = False
-        while element:
-            if element.ID == 48:
-                has_rsn = True
-            if element.ID == 221:
-                if element.info[:4] == b'\x00\x50\xf2\x01':
-                    has_wpa = True
+                    rates.append(
+                        (
+                            rate & 0x7F
+                        )
+                        * 0.5
+                    )
+
+
             element = element.payload
-        cap         = packet[Dot11Beacon].cap
-        has_privacy = bool(cap & 0x0010)
+
+
+        unique_rates = sorted(
+            set(
+                rates
+            )
+        )
+
+
+        supported_rates = (
+            ",".join(
+                map(
+                    str,
+                    unique_rates,
+                )
+            )
+            if unique_rates
+            else "unknown"
+        )
+
+
+        rate_count = len(
+            unique_rates
+        )
+
+
+        # ------------------------------------------------
+        # SECURITY CHARACTERISTICS
+        # ------------------------------------------------
+
+        security = "Open"
+
+        has_rsn = False
+        has_wpa = False
+
+
+        element = packet[
+            Dot11Elt
+        ]
+
+
+        while isinstance(
+            element,
+            Dot11Elt,
+        ):
+
+            if element.ID == 48:
+
+                has_rsn = True
+
+
+            if (
+                element.ID == 221
+                and element.info[:4]
+                == b"\x00\x50\xf2\x01"
+            ):
+
+                has_wpa = True
+
+
+            element = element.payload
+
+
+        capabilities = int(
+            packet[
+                Dot11Beacon
+            ].cap
+        )
+
+
         if has_rsn:
+
             security = "WPA2/WPA3"
+
         elif has_wpa:
+
             security = "WPA"
-        elif has_privacy:
+
+        elif capabilities & 0x0010:
+
             security = "WEP"
 
-        # Sequence number
-        seq_num          = packet[Dot11].SC >> 4
-        beacon_timestamp = packet[Dot11Beacon].timestamp
-        beacon_interval  = packet[Dot11Beacon].beacon_interval
-        capabilities     = packet[Dot11Beacon].cap
 
-        # Sequence jump
-        seq_jump      = 0
-        anomaly_score = 0.0
-        if bssid in seq_tracker and seq_tracker[bssid]:
-            last_seq = seq_tracker[bssid][-1]
-            if seq_num >= last_seq:
-                seq_jump = seq_num - last_seq
+        # ------------------------------------------------
+        # BASIC BEACON VALUES
+        # ------------------------------------------------
+
+        seq_num = (
+            packet[
+                Dot11
+            ].SC >> 4
+        )
+
+
+        beacon_timestamp = (
+            packet[
+                Dot11Beacon
+            ].timestamp
+        )
+
+
+        beacon_interval = (
+            packet[
+                Dot11Beacon
+            ].beacon_interval
+        )
+
+
+        # ------------------------------------------------
+        # SEQUENCE BEHAVIOR
+        # ------------------------------------------------
+
+        seq_jump = 0
+
+        seq_anomaly_score = 0.0
+
+
+        if (
+            bssid in seq_tracker
+            and seq_tracker[bssid]
+        ):
+
+            previous_seq = (
+                seq_tracker[
+                    bssid
+                ][-1]
+            )
+
+
+            if seq_num >= previous_seq:
+
+                seq_jump = (
+                    seq_num
+                    - previous_seq
+                )
+
             else:
-                seq_jump = (4095 - last_seq) + seq_num
+
+                # 12-bit sequence field:
+                # 0 through 4095.
+                seq_jump = (
+                    4096
+                    - previous_seq
+                    + seq_num
+                )
+
+
             if seq_jump > 100:
-                anomaly_score = min(1.0, seq_jump / 1000)
+
+                seq_anomaly_score = min(
+                    1.0,
+                    seq_jump / 1000,
+                )
+
             elif seq_jump > 10:
-                anomaly_score = 0.3
+
+                seq_anomaly_score = 0.3
+
+
         if bssid not in seq_tracker:
-            seq_tracker[bssid] = []
-        seq_tracker[bssid].append(seq_num)
-        if len(seq_tracker[bssid]) > 10:
-            seq_tracker[bssid].pop(0)
 
-        # Clock skew
-        skew = 0.0
+            seq_tracker[
+                bssid
+            ] = []
+
+
+        seq_tracker[
+            bssid
+        ].append(
+            seq_num
+        )
+
+
+        if len(
+            seq_tracker[bssid]
+        ) > 20:
+
+            seq_tracker[
+                bssid
+            ].pop(0)
+
+
+        # ------------------------------------------------
+        # TIMING / CLOCK-SKEW ESTIMATE
+        # ------------------------------------------------
+
+        clock_skew = 0.0
+        valid_skew = False
+
+
         if bssid not in ts_tracker:
-            ts_tracker[bssid] = []
-        ts_tracker[bssid].append({
-            'beacon_ts': beacon_timestamp,
-            'system_ts': system_time
-        })
-        if len(ts_tracker[bssid]) >= 2:
-            first         = ts_tracker[bssid][0]
-            last          = ts_tracker[bssid][-1]
-            ap_diff       = last['beacon_ts'] - first['beacon_ts']
-            sys_diff      = (last['system_ts'] - first['system_ts']) * 1_000_000
-            if sys_diff > 0:
-                skew = (ap_diff - sys_diff) / sys_diff
-        if len(ts_tracker[bssid]) > 20:
-            ts_tracker[bssid].pop(0)
 
-        # IE count
+            ts_tracker[
+                bssid
+            ] = []
+
+
+        ts_tracker[
+            bssid
+        ].append(
+            {
+                "beacon_ts":
+                    beacon_timestamp,
+
+                "system_ts":
+                    system_time,
+            }
+        )
+
+
+        if len(
+            ts_tracker[bssid]
+        ) > 20:
+
+            ts_tracker[
+                bssid
+            ].pop(0)
+
+
+        if len(
+            ts_tracker[bssid]
+        ) >= 2:
+
+            previous = (
+                ts_tracker[
+                    bssid
+                ][-2]
+            )
+
+            current = (
+                ts_tracker[
+                    bssid
+                ][-1]
+            )
+
+
+            system_gap = (
+                current["system_ts"]
+                - previous["system_ts"]
+            )
+
+
+            # The profiler normally locks to one channel,
+            # but receiver-side timing noise can still
+            # occur. Retain the same validity window used
+            # elsewhere in the current prototype.
+            if (
+                0.05
+                <= system_gap
+                <= 0.25
+            ):
+
+                ap_difference = (
+                    current["beacon_ts"]
+                    - previous["beacon_ts"]
+                )
+
+
+                system_difference = (
+                    system_gap
+                    * 1_000_000
+                )
+
+
+                if system_difference > 0:
+
+                    clock_skew = (
+                        ap_difference
+                        - system_difference
+                    ) / system_difference
+
+                    valid_skew = True
+
+
+        # ------------------------------------------------
+        # INFORMATION ELEMENT COUNT
+        # ------------------------------------------------
+
         ie_count = 0
-        element  = packet[Dot11Elt]
-        while element and isinstance(element, Dot11Elt):
+
+
+        element = packet[
+            Dot11Elt
+        ]
+
+
+        while isinstance(
+            element,
+            Dot11Elt,
+        ):
+
             ie_count += 1
-            element   = element.payload
+
+            element = element.payload
+
 
         return {
-            'timestamp':         time.strftime("%Y-%m-%d %H:%M:%S"),
-            'ssid':              ssid,
-            'bssid':             bssid,
-            'rssi':              rssi,
-            'channel':           channel,
-            'seq_num':           seq_num,
-            'seq_jump':          seq_jump,
-            'seq_anomaly_score': round(anomaly_score, 4),
-            'beacon_timestamp':  beacon_timestamp,
-            'clock_skew':        round(skew, 6),
-            'beacon_interval':   beacon_interval,
-            'capabilities':      capabilities,
-            'supported_rates':   supported_rates,
-            'security':          security,
-            'ie_count':          ie_count,
-            'label':             0    # Normal data
+
+            "timestamp":
+                time.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+
+            "ssid":
+                ssid,
+
+            "bssid":
+                bssid,
+
+            "rssi":
+                rssi,
+
+            "channel":
+                channel,
+
+            "seq_num":
+                seq_num,
+
+            "seq_jump":
+                seq_jump,
+
+            "seq_anomaly_score":
+                round(
+                    seq_anomaly_score,
+                    4,
+                ),
+
+            "beacon_timestamp":
+                beacon_timestamp,
+
+            "clock_skew":
+                round(
+                    clock_skew,
+                    8,
+                ),
+
+            "valid_skew":
+                int(
+                    valid_skew
+                ),
+
+            "beacon_interval":
+                beacon_interval,
+
+            "capabilities":
+                capabilities,
+
+            "supported_rates":
+                supported_rates,
+
+            "rate_count":
+                rate_count,
+
+            "security":
+                security,
+
+            "ie_count":
+                ie_count,
+
+            "label":
+                0,
         }
 
+
     except Exception:
+
         return None
 
 
-# ─────────────────────────────────────────────────────
+# =======================================================
 # PACKET HANDLER
-# ─────────────────────────────────────────────────────
+# =======================================================
 
-def profile_handler(packet):
+def profile_handler(
+    packet,
+):
     """
-    Handle packets during profiling phase.
-    Only captures beacons from our target network.
+    Capture beacon frames belonging to the selected AP.
     """
-    if not packet.haslayer(Dot11Beacon):
+
+    if not packet.haslayer(
+        Dot11Beacon
+    ):
+
         return
 
+
     try:
-        bssid = packet[Dot11].addr2
+
+        bssid = packet[
+            Dot11
+        ].addr2
+
+
+        if not bssid:
+
+            return
+
+
+        bssid = bssid.lower()
+
+
         try:
-            ssid = packet[Dot11Elt].info.decode('utf-8', errors='replace')
+
+            ssid = (
+                packet[
+                    Dot11Elt
+                ]
+                .info
+                .decode(
+                    "utf-8",
+                    errors="replace",
+                )
+            )
+
         except Exception:
-            ssid = "unknown"
 
-        # Filter: only capture our target network
-        if target_bssid and bssid != target_bssid:
+            ssid = "<Unknown>"
+
+
+        if target_bssid:
+
+            if (
+                bssid
+                != target_bssid.lower()
+            ):
+
+                return
+
+
+        if (
+            target_ssid
+            and ssid
+            != target_ssid
+        ):
+
             return
-        if target_ssid and ssid != target_ssid:
+
+
+        features = extract_features(
+            packet,
+            time.time(),
+        )
+
+
+        if not features:
+
             return
 
-        system_time = time.time()
-        features    = extract_features(packet, system_time)
 
-        if features:
-            captured_beacons.append(features)
-            count = len(captured_beacons)
+        captured_beacons.append(
+            features
+        )
 
-            # Progress display
-            bar_filled = int((count / config.MIN_SAMPLES_NEEDED) * 20)
-            bar_filled = min(bar_filled, 20)
-            bar        = "█" * bar_filled + "░" * (20 - bar_filled)
-            pct        = min(int((count / config.MIN_SAMPLES_NEEDED) * 100), 100)
 
-            print(f"\r  [{bar}] {pct}%  "
-                  f"Beacons: {count}  "
-                  f"RSSI: {features['rssi']} dBm  "
-                  f"Skew: {features['clock_skew']:.6f}    ",
-                  end='', flush=True)
+        count = len(
+            captured_beacons
+        )
+
+
+        bar_filled = int(
+            (
+                count
+                / config.MIN_SAMPLES_NEEDED
+            )
+            * 20
+        )
+
+
+        bar_filled = min(
+            bar_filled,
+            20,
+        )
+
+
+        bar = (
+            "█" * bar_filled
+            + "░"
+            * (
+                20
+                - bar_filled
+            )
+        )
+
+
+        percent = min(
+            int(
+                (
+                    count
+                    / config.MIN_SAMPLES_NEEDED
+                )
+                * 100
+            ),
+            100,
+        )
+
+
+        print(
+            f"\r  [{bar}] "
+            f"{percent}%  "
+            f"Beacons: {count}  "
+            f"RSSI: {features['rssi']} dBm  "
+            f"Skew: "
+            f"{features['clock_skew']:.6f}    ",
+            end="",
+            flush=True,
+        )
+
 
     except Exception:
+
         pass
 
 
-# ─────────────────────────────────────────────────────
-# CHANNEL LOCKER
-# ─────────────────────────────────────────────────────
+# =======================================================
+# CHANNEL LOCK
+# =======================================================
 
-def channel_locker(interface, channel):
+def channel_locker(
+    interface,
+    channel,
+):
     """
-    Lock the interface on target channel during profiling.
-    Checks every 5 seconds to ensure it stays locked.
+    Keep the monitor interface on the selected channel.
     """
+
     global hop_active
+
+
     while hop_active:
-        os.system(f"iwconfig {interface} channel {channel} 2>/dev/null")
-        time.sleep(5)
+
+        os.system(
+            f"iwconfig {interface} "
+            f"channel {channel} "
+            "2>/dev/null"
+        )
+
+        time.sleep(
+            5
+        )
 
 
-# ─────────────────────────────────────────────────────
-# BUILD PROFILE
-# ─────────────────────────────────────────────────────
+# =======================================================
+# PROFILE BUILDER
+# =======================================================
 
-def build_profile(network_info):
+def build_profile(
+    network_info,
+):
     """
-    Build a statistical behavioral profile for an AP.
+    Build a statistical baseline for the selected AP.
 
-    This profile captures the NORMAL behavior of the AP.
-    Later, when detecting, we compare live beacons to
-    this profile. If behavior deviates too much = ALERT!
+    The resulting profile contains:
 
-    Profile contains:
-    - Mean and std of RSSI
-    - Mean and std of sequence jumps
-    - Mean and std of clock skew
-    - Exact IE count (hardware fingerprint)
-    - Exact supported rates (hardware fingerprint)
-    - Exact beacon interval
-    - Exact security type
+    - RSSI statistics
+    - Sequence-jump statistics
+    - Valid clock-skew statistics
+    - Typical IE count
+    - Typical supported rates
+    - Typical beacon interval
+    - Advertised security
+    - Capability flags
 
-    Parameters:
-        network_info: dict with ssid, bssid, channel
-
-    Returns:
-        profile dict or None if failed
+    These characteristics are expected baselines, not
+    immutable hardware fingerprints.
     """
-    if len(captured_beacons) < 10:
-        print(f"\n[ERROR] Not enough beacons captured: {len(captured_beacons)}")
-        print("[ERROR] Need at least 10 beacons to build profile")
+
+    if len(
+        captured_beacons
+    ) < 10:
+
+        print(
+            "\n[ERROR] Not enough beacons captured: "
+            f"{len(captured_beacons)}"
+        )
+
+        print(
+            "[ERROR] Need at least 10 beacons "
+            "to build a profile."
+        )
+
         return None
 
-    df = pd.DataFrame(captured_beacons)
 
-    # Statistical profile of each feature
+    df = pd.DataFrame(
+        captured_beacons
+    )
+
+
+    # Prefer only timing observations that passed the
+    # validity filter.
+    if (
+        "valid_skew"
+        in df.columns
+    ):
+
+        valid_skew_df = df[
+            df[
+                "valid_skew"
+            ] == 1
+        ]
+
+    else:
+
+        valid_skew_df = df
+
+
+    if len(
+        valid_skew_df
+    ) > 0:
+
+        skew_mean = float(
+            valid_skew_df[
+                "clock_skew"
+            ].mean()
+        )
+
+        skew_std = float(
+            valid_skew_df[
+                "clock_skew"
+            ].std()
+        )
+
+    else:
+
+        skew_mean = 0.0
+        skew_std = 0.0
+
+
+    # pandas std() can produce NaN when only one value
+    # exists.
+    if pd.isna(
+        skew_std
+    ):
+
+        skew_std = 0.0
+
+
+    rssi_std = float(
+        df[
+            "rssi"
+        ].std()
+    )
+
+
+    if pd.isna(
+        rssi_std
+    ):
+
+        rssi_std = 0.0
+
+
+    seq_jump_std = float(
+        df[
+            "seq_jump"
+        ].std()
+    )
+
+
+    if pd.isna(
+        seq_jump_std
+    ):
+
+        seq_jump_std = 0.0
+
+
     profile = {
+
         # Identity
-        'ssid':    network_info['ssid'],
-        'bssid':   network_info['bssid'],
-        'channel': network_info['channel'],
+        "ssid":
+            network_info[
+                "ssid"
+            ],
 
-        # RSSI statistics
-        # Real AP has consistent RSSI from fixed location
-        'rssi_mean':  float(df['rssi'].mean()),
-        'rssi_std':   float(df['rssi'].std()),
-        'rssi_min':   float(df['rssi'].min()),
-        'rssi_max':   float(df['rssi'].max()),
+        "bssid":
+            network_info[
+                "bssid"
+            ].lower(),
 
-        # Sequence number statistics
-        # Normal jumps are small (1-5)
-        # Large jumps = possible Evil Twin
-        'seq_jump_mean': float(df['seq_jump'].mean()),
-        'seq_jump_std':  float(df['seq_jump'].std()),
-        'seq_jump_max':  float(df['seq_jump'].max()),
+        "channel":
+            network_info[
+                "channel"
+            ],
 
-        # Clock skew statistics
-        # Each hardware has unique clock drift pattern
-        'clock_skew_mean': float(df['clock_skew'].mean()),
-        'clock_skew_std':  float(df['clock_skew'].std()),
 
-        # Hardware fingerprints (should be EXACT same)
-        # If different = definitely different hardware = Evil Twin!
-        'ie_count':       int(df['ie_count'].mode()[0]),
-        'supported_rates': str(df['supported_rates'].mode()[0]),
-        'beacon_interval': int(df['beacon_interval'].mode()[0]),
-        'security':        str(df['security'].mode()[0]),
-        'capabilities':    int(df['capabilities'].mode()[0]),
+        # RSSI baseline
+        "rssi_mean":
+            float(
+                df[
+                    "rssi"
+                ].mean()
+            ),
+
+        "rssi_std":
+            rssi_std,
+
+        "rssi_min":
+            float(
+                df[
+                    "rssi"
+                ].min()
+            ),
+
+        "rssi_max":
+            float(
+                df[
+                    "rssi"
+                ].max()
+            ),
+
+
+        # Sequence behavior
+        "seq_jump_mean":
+            float(
+                df[
+                    "seq_jump"
+                ].mean()
+            ),
+
+        "seq_jump_std":
+            seq_jump_std,
+
+        "seq_jump_max":
+            float(
+                df[
+                    "seq_jump"
+                ].max()
+            ),
+
+
+        # Timing behavior
+        "clock_skew_mean":
+            skew_mean,
+
+        "clock_skew_std":
+            skew_std,
+
+        "valid_skew_samples":
+            int(
+                len(
+                    valid_skew_df
+                )
+            ),
+
+
+        # Structural / configuration baseline
+        "ie_count":
+            int(
+                df[
+                    "ie_count"
+                ].mode().iloc[0]
+            ),
+
+        "supported_rates":
+            str(
+                df[
+                    "supported_rates"
+                ].mode().iloc[0]
+            ),
+
+        "rate_count":
+            int(
+                df[
+                    "rate_count"
+                ].mode().iloc[0]
+            ),
+
+        "beacon_interval":
+            int(
+                df[
+                    "beacon_interval"
+                ].mode().iloc[0]
+            ),
+
+        "security":
+            str(
+                df[
+                    "security"
+                ].mode().iloc[0]
+            ),
+
+        "capabilities":
+            int(
+                df[
+                    "capabilities"
+                ].mode().iloc[0]
+            ),
+
 
         # Metadata
-        'total_beacons':  len(df),
-        'profile_time':   time.strftime("%Y-%m-%d %H:%M:%S"),
-        'raw_data_file':  config.NORMAL_DATA_FILE
+        "total_beacons":
+            len(
+                df
+            ),
+
+        "profile_time":
+            time.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+
+        "profile_type":
+            "legacy_single_ap",
+
+        "raw_data_file":
+            config.NORMAL_DATA_FILE,
     }
+
 
     return profile
 
 
-# ─────────────────────────────────────────────────────
-# SAVE PROFILE AND DATA
-# ─────────────────────────────────────────────────────
+# =======================================================
+# SAVE PROFILE
+# =======================================================
 
-def save_profile(profile):
-    """Save AP profile to JSON file."""
-    os.makedirs(config.DATA_DIR, exist_ok=True)
+def save_profile(
+    profile,
+):
+    """
+    Save the legacy single-AP profile to JSON.
+    """
 
-    # Load existing profiles
+    os.makedirs(
+        config.DATA_DIR,
+        exist_ok=True,
+    )
+
+
     profiles = {}
-    if os.path.exists(config.AP_PROFILES_FILE):
+
+
+    if os.path.exists(
+        config.AP_PROFILES_FILE
+    ):
+
         try:
-            with open(config.AP_PROFILES_FILE, 'r') as f:
-                profiles = json.load(f)
+
+            with open(
+                config.AP_PROFILES_FILE,
+                "r",
+                encoding="utf-8",
+            ) as file:
+
+                profiles = json.load(
+                    file
+                )
+
         except Exception:
+
             profiles = {}
 
-    # Add/update this network's profile
-    # Use BSSID as key (unique identifier)
-    profiles[profile['bssid']] = profile
 
-    # Save all profiles
-    with open(config.AP_PROFILES_FILE, 'w') as f:
-        json.dump(profiles, f, indent=2)
+    profiles[
+        profile[
+            "bssid"
+        ]
+    ] = profile
 
-    print(f"\n[✓] Profile saved: {config.AP_PROFILES_FILE}")
 
+    with open(
+        config.AP_PROFILES_FILE,
+        "w",
+        encoding="utf-8",
+    ) as file:
+
+        json.dump(
+            profiles,
+            file,
+            indent=2,
+        )
+
+
+    print(
+        "\n[✓] Legacy profile saved:"
+    )
+
+    print(
+        f"    {config.AP_PROFILES_FILE}"
+    )
+
+
+# =======================================================
+# SAVE SINGLE-AP DATA
+# =======================================================
 
 def save_normal_data():
-    """Save captured beacons to CSV for AI training."""
+    """
+    Save observations from the legacy single-AP
+    profiling workflow.
+
+    This dataset is not the primary dataset used by the
+    current multi-AP detector.
+    """
+
     if not captured_beacons:
+
         return
 
-    df = pd.DataFrame(captured_beacons)
-    os.makedirs(config.DATA_DIR, exist_ok=True)
 
-    if os.path.exists(config.NORMAL_DATA_FILE):
-        df.to_csv(config.NORMAL_DATA_FILE, mode='a',
-                  header=False, index=False)
+    df = pd.DataFrame(
+        captured_beacons
+    )
+
+
+    os.makedirs(
+        config.DATA_DIR,
+        exist_ok=True,
+    )
+
+
+    if os.path.exists(
+        config.NORMAL_DATA_FILE
+    ):
+
+        df.to_csv(
+            config.NORMAL_DATA_FILE,
+            mode="a",
+            header=False,
+            index=False,
+        )
+
     else:
-        df.to_csv(config.NORMAL_DATA_FILE, index=False)
 
-    print(f"[✓] Training data saved: {config.NORMAL_DATA_FILE}")
-    print(f"[✓] Total rows saved: {len(df)}")
+        df.to_csv(
+            config.NORMAL_DATA_FILE,
+            index=False,
+        )
 
 
-# ─────────────────────────────────────────────────────
-# MAIN PROFILE FUNCTION
-# ─────────────────────────────────────────────────────
+    print(
+        "[✓] Legacy single-AP observations saved:"
+    )
 
-def profile_network(interface, network_info,
-                    duration=config.PROFILE_DURATION):
+    print(
+        f"    {config.NORMAL_DATA_FILE}"
+    )
+
+    print(
+        f"[✓] Rows saved: {len(df)}"
+    )
+
+
+# =======================================================
+# MAIN PROFILING FUNCTION
+# =======================================================
+
+def profile_network(
+    interface,
+    network_info,
+    duration=config.PROFILE_DURATION,
+):
     """
-    Main function to profile a network.
+    Run the legacy single-AP profiling workflow.
 
-    Automatically:
-    1. Locks on correct channel
-    2. Captures beacons for specified duration
-    3. Builds statistical profile
-    4. Saves profile and training data
+    This function:
 
-    Parameters:
-        interface    : monitor mode interface
-        network_info : dict with ssid, bssid, channel
-        duration     : seconds to observe (default 60)
+    1. Locks the monitor interface to the selected channel.
+    2. Captures beacon frames from the selected AP.
+    3. Builds a statistical behavioral baseline.
+    4. Saves the legacy profile and observations.
 
-    Returns:
-        profile dict or None
+    For the current multi-AP research workflow, use:
+
+        scripts/collect_all_aps.py
+        scripts/build_profiles.py
+        scripts/build_advanced_model.py
     """
-    global target_ssid, target_bssid, target_channel
-    global hop_active, captured_beacons
 
-    # Reset
+    global target_ssid
+    global target_bssid
+    global target_channel
+    global hop_active
+    global captured_beacons
+
+
     captured_beacons = []
+
     seq_tracker.clear()
     ts_tracker.clear()
 
-    target_ssid    = network_info['ssid']
-    target_bssid   = network_info['bssid']
-    target_channel = network_info['channel']
 
-    print("\n" + "="*55)
-    print("  BUILDING NETWORK PROFILE")
-    print("="*55)
-    print(f"  Network : {target_ssid}")
-    print(f"  BSSID   : {target_bssid}")
-    print(f"  Channel : {target_channel}")
-    print(f"  Duration: {duration} seconds")
-    print("="*55)
-    print("  Observing normal behavior...")
-    print("  (Do not simulate any attacks now)\n")
-
-    # Lock on target channel
-    hop_active     = True
-    locker         = threading.Thread(
-                        target=channel_locker,
-                        args=(interface, target_channel),
-                        daemon=True
-                    )
-    locker.start()
-    time.sleep(1)
-
-    # Capture beacons
-    sniff(
-        iface=interface,
-        prn=profile_handler,
-        timeout=duration,
-        store=False
+    target_ssid = (
+        network_info[
+            "ssid"
+        ]
     )
 
-    hop_active = False
-    print(f"\n\n[✓] Captured {len(captured_beacons)} beacons")
+    target_bssid = (
+        network_info[
+            "bssid"
+        ]
+    )
 
-    if len(captured_beacons) < 10:
-        print("[ERROR] Too few beacons captured!")
-        print(f"[ERROR] Check that '{target_ssid}' is nearby")
+    target_channel = (
+        network_info[
+            "channel"
+        ]
+    )
+
+
+    print(
+        "\n"
+        + "=" * 60
+    )
+
+    print(
+        "  LEGACY SINGLE-AP BEHAVIORAL PROFILER"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        f"  Network : {target_ssid}"
+    )
+
+    print(
+        f"  BSSID   : {target_bssid}"
+    )
+
+    print(
+        f"  Channel : {target_channel}"
+    )
+
+    print(
+        f"  Duration: {duration} seconds"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "  Collecting a benign behavioral baseline..."
+    )
+
+    print(
+        "  Do not run attack simulations during profiling.\n"
+    )
+
+
+    hop_active = True
+
+
+    locker = threading.Thread(
+        target=channel_locker,
+        args=(
+            interface,
+            target_channel,
+        ),
+        daemon=True,
+    )
+
+
+    locker.start()
+
+
+    time.sleep(
+        1
+    )
+
+
+    try:
+
+        sniff(
+            iface=interface,
+            prn=profile_handler,
+            timeout=duration,
+            store=False,
+        )
+
+    finally:
+
+        hop_active = False
+
+
+    print(
+        "\n\n[✓] Captured "
+        f"{len(captured_beacons)} "
+        "beacons"
+    )
+
+
+    if len(
+        captured_beacons
+    ) < 10:
+
+        print(
+            "[ERROR] Too few beacons captured."
+        )
+
+        print(
+            f"[ERROR] Check that "
+            f"'{target_ssid}' is nearby."
+        )
+
         return None
 
-    # Build profile
-    print("[*] Building behavioral profile...")
-    profile = build_profile(network_info)
+
+    print(
+        "[*] Building behavioral baseline..."
+    )
+
+
+    profile = build_profile(
+        network_info
+    )
+
 
     if profile:
-        # Print profile summary
-        print("\n" + "="*55)
-        print("  PROFILE SUMMARY")
-        print("="*55)
-        print(f"  SSID           : {profile['ssid']}")
-        print(f"  BSSID          : {profile['bssid']}")
-        print(f"  RSSI range     : {profile['rssi_min']:.0f}"
-              f" to {profile['rssi_max']:.0f} dBm")
-        print(f"  Avg seq jump   : {profile['seq_jump_mean']:.2f}")
-        print(f"  Clock skew avg : {profile['clock_skew_mean']:.6f}")
-        print(f"  IE count       : {profile['ie_count']}")
-        print(f"  Security       : {profile['security']}")
-        print(f"  Beacon interval: {profile['beacon_interval']}")
-        print(f"  Beacons seen   : {profile['total_beacons']}")
-        print("="*55)
 
-        # Save everything
-        save_profile(profile)
+        print(
+            "\n"
+            + "=" * 60
+        )
+
+        print(
+            "  PROFILE SUMMARY"
+        )
+
+        print(
+            "=" * 60
+        )
+
+        print(
+            f"  SSID             : "
+            f"{profile['ssid']}"
+        )
+
+        print(
+            f"  BSSID            : "
+            f"{profile['bssid']}"
+        )
+
+        print(
+            f"  RSSI range       : "
+            f"{profile['rssi_min']:.0f} "
+            f"to "
+            f"{profile['rssi_max']:.0f} dBm"
+        )
+
+        print(
+            f"  Avg seq jump     : "
+            f"{profile['seq_jump_mean']:.2f}"
+        )
+
+        print(
+            f"  Clock skew avg   : "
+            f"{profile['clock_skew_mean']:.6f}"
+        )
+
+        print(
+            f"  Valid skew rows  : "
+            f"{profile['valid_skew_samples']}"
+        )
+
+        print(
+            f"  IE count         : "
+            f"{profile['ie_count']}"
+        )
+
+        print(
+            f"  Rate count       : "
+            f"{profile['rate_count']}"
+        )
+
+        print(
+            f"  Security         : "
+            f"{profile['security']}"
+        )
+
+        print(
+            f"  Beacon interval  : "
+            f"{profile['beacon_interval']}"
+        )
+
+        print(
+            f"  Beacons observed : "
+            f"{profile['total_beacons']}"
+        )
+
+        print(
+            "=" * 60
+        )
+
+
+        save_profile(
+            profile
+        )
+
         save_normal_data()
+
 
     return profile
 
 
-# ─────────────────────────────────────────────────────
-# LOAD EXISTING PROFILES
-# ─────────────────────────────────────────────────────
+# =======================================================
+# LOAD LEGACY PROFILES
+# =======================================================
 
 def load_profiles():
     """
-    Load previously saved AP profiles.
-    This allows the tool to remember networks
-    across multiple runs without re-profiling.
+    Load profiles from the older single-AP profile file.
     """
-    if not os.path.exists(config.AP_PROFILES_FILE):
+
+    if not os.path.exists(
+        config.AP_PROFILES_FILE
+    ):
+
         return {}
 
+
     try:
-        with open(config.AP_PROFILES_FILE, 'r') as f:
-            profiles = json.load(f)
-        print(f"[✓] Loaded {len(profiles)} saved profiles")
+
+        with open(
+            config.AP_PROFILES_FILE,
+            "r",
+            encoding="utf-8",
+        ) as file:
+
+            profiles = json.load(
+                file
+            )
+
+
+        print(
+            f"[✓] Loaded {len(profiles)} "
+            "legacy single-AP profiles"
+        )
+
+
         return profiles
-    except Exception as e:
-        print(f"[!] Could not load profiles: {e}")
+
+
+    except Exception as error:
+
+        print(
+            "[!] Could not load legacy profiles:"
+        )
+
+        print(
+            f"    {error}"
+        )
+
         return {}
