@@ -382,15 +382,20 @@ def test_non_beacon_packet_is_ignored():
     records.
     """
 
-   packet = Dot11(
-    type=2,
-    addr1="ff:ff:ff:ff:ff:ff",
-    addr2=TEST_BSSID,
-    addr3=TEST_BSSID,
-)
+    packet = Dot11(
+        type=2,
+        addr1="ff:ff:ff:ff:ff:ff",
+        addr2=TEST_BSSID,
+        addr3=TEST_BSSID,
+    )
 
     scanner.scan_handler(
         packet
+    )
+
+    assert (
+        scanner.discovered_networks
+        == {}
     )
 
     assert (
