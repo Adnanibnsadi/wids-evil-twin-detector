@@ -1,443 +1,1437 @@
 #!/usr/bin/env python3
 """
 =======================================================
-  modules/detector.py - Calibrated AI Evil Twin Detector
+ modules/detector.py - Hybrid Evil Twin / Rogue AP WIDS
 =======================================================
-  Calibrated for real-world RF environments & VMware.
-  Includes jitter filtering and multi-frame confirmation.
+
+Passive 802.11 beacon monitoring and anomaly detection.
+
+The detector combines:
+- Known SSID/BSSID profile comparison
+- Sequence-number behavior
+- Beacon Information Element structure
+- Advertised security characteristics
+- Timing / clock-skew deviation
+- Per-BSSID Isolation Forest anomaly models
+
+Designed for research and controlled laboratory evaluation.
+
+Important:
+The generated threat score is a heuristic suspicion score.
+It is not a calibrated probability that an attack is present.
 =======================================================
 """
 
-from scapy.all import *
-from scapy.layers.dot11 import Dot11, Dot11Beacon, Dot11Elt, RadioTap
-import pandas as pd
-import numpy as np
+import datetime
 import json
 import os
 import sys
-import time
 import threading
-import datetime
-import joblib
+import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import joblib
+import numpy as np
+from scapy.all import sniff
+from scapy.layers.dot11 import (
+    Dot11,
+    Dot11Beacon,
+    Dot11Elt,
+    RadioTap,
+)
+
+sys.path.insert(
+    0,
+    os.path.dirname(
+        os.path.dirname(
+            os.path.abspath(__file__)
+        )
+    ),
+)
+
 import config
+
 
 # ─────────────────────────────────────────────────────
 # GLOBAL STATE
 # ─────────────────────────────────────────────────────
-detection_running  = False
-hop_running        = False
-packet_count       = 0
-alert_count        = 0
 
-# Loaded models and profiles
-bssid_profiles     = {}
-per_bssid_bundle   = {}
-global_bundle      = {}
+detection_running = False
+hop_running = False
 
-# Dynamic trackers
-seq_tracker        = {}
-ts_tracker         = {}
-last_seen_seq      = {}  # { "bssid_seq": system_time }
-last_seen_bssid    = {}  # { bssid: system_time }
-alert_cooldown     = {}  # { bssid: last_alert_time }
-suspicious_streak  = {}  # { bssid: count_of_consecutive_suspicious_frames }
+packet_count = 0
+alert_count = 0
+
+
+# Loaded profiles and anomaly models
+bssid_profiles = {}
+per_bssid_bundle = {}
+global_bundle = {}
+
+
+# Runtime tracking state
+seq_tracker = {}
+ts_tracker = {}
+
+# {"bssid_sequence": system_time}
+last_seen_seq = {}
+
+# {bssid: system_time}
+last_seen_bssid = {}
+
+# {bssid: last_alert_time}
+alert_cooldown = {}
+
+# {bssid: consecutive_suspicious_frames}
+suspicious_streak = {}
+
 
 ALERT_COOLDOWN_SEC = 10
-REQUIRED_STREAK    = 2   # Require 2 consecutive suspicious frames to confirm
+
+# Require multiple suspicious observations before alerting.
+REQUIRED_STREAK = 2
+
 
 # ─────────────────────────────────────────────────────
 # RESOURCE LOADER
 # ─────────────────────────────────────────────────────
 
 def load_resources():
-    global bssid_profiles, per_bssid_bundle, global_bundle
-    
+    """
+    Load AP profiles and anomaly-detection models.
+
+    Returns
+    -------
+    bool
+        True when all required resources are available.
+    """
+
+    global bssid_profiles
+    global per_bssid_bundle
+    global global_bundle
+
     if os.path.exists(config.BSSID_PROFILES_FILE):
-        with open(config.BSSID_PROFILES_FILE, 'r') as f:
-            bssid_profiles = json.load(f)
-        print(f"[✓] Loaded {len(bssid_profiles)} AP profiles from bssid_profiles.json")
+        with open(
+            config.BSSID_PROFILES_FILE,
+            "r",
+            encoding="utf-8",
+        ) as file:
+            bssid_profiles = json.load(file)
+
+        print(
+            f"[✓] Loaded {len(bssid_profiles)} "
+            "AP behavioral profiles"
+        )
+
     else:
-        print(f"[ERROR] Profiles not found at {config.BSSID_PROFILES_FILE}")
+        print(
+            "[ERROR] BSSID profiles not found at "
+            f"{config.BSSID_PROFILES_FILE}"
+        )
         return False
-        
-    per_bssid_path = os.path.join(config.MODELS_DIR, 'per_bssid_models.pkl')
+
+    per_bssid_path = os.path.join(
+        config.MODELS_DIR,
+        "per_bssid_models.pkl",
+    )
+
     if os.path.exists(per_bssid_path):
-        per_bssid_bundle = joblib.load(per_bssid_path)
-        print(f"[✓] Loaded {len(per_bssid_bundle['models'])} Per-BSSID AI models")
+        per_bssid_bundle = joblib.load(
+            per_bssid_path
+        )
+
+        model_count = len(
+            per_bssid_bundle.get(
+                "models",
+                {},
+            )
+        )
+
+        print(
+            f"[✓] Loaded {model_count} "
+            "per-BSSID anomaly models"
+        )
+
     else:
-        print(f"[ERROR] Per-BSSID models not found at {per_bssid_path}")
+        print(
+            "[ERROR] Per-BSSID models not found at "
+            f"{per_bssid_path}"
+        )
         return False
-        
-    global_path = os.path.join(config.MODELS_DIR, 'global_model.pkl')
+
+    global_path = os.path.join(
+        config.MODELS_DIR,
+        "global_model.pkl",
+    )
+
     if os.path.exists(global_path):
-        global_bundle = joblib.load(global_path)
-        print(f"[✓] Loaded Global Anomaly AI model")
+        global_bundle = joblib.load(
+            global_path
+        )
+
+        print(
+            "[✓] Loaded global anomaly model"
+        )
+
     else:
-        print(f"[ERROR] Global model not found at {global_path}")
+        print(
+            "[ERROR] Global model not found at "
+            f"{global_path}"
+        )
         return False
-        
+
     return True
 
+
 # ─────────────────────────────────────────────────────
-# FEATURE EXTRACTION (WITH JITTER FILTER)
+# FEATURE EXTRACTION
 # ─────────────────────────────────────────────────────
 
 def extract_features(packet, system_time):
+    """
+    Extract behavioral and structural features from one
+    802.11 beacon frame.
+
+    Timing-derived features are filtered to reduce the
+    influence of channel hopping and VMware / USB jitter.
+    """
+
     try:
-        bssid = packet[Dot11].addr2.lower()
-        
+        bssid = packet[Dot11].addr2
+
+        if not bssid:
+            return None
+
+        bssid = bssid.lower()
+
+        # ── SSID ──────────────────────────────────────
+
         try:
-            ssid = packet[Dot11Elt].info.decode('utf-8', errors='replace')
+            ssid = packet[
+                Dot11Elt
+            ].info.decode(
+                "utf-8",
+                errors="replace",
+            )
+
         except Exception:
             ssid = "<Hidden>"
+
         if not ssid.strip():
             ssid = "<Hidden>"
-            
+
+
+        # ── RSSI ──────────────────────────────────────
+
         rssi = 0
+
         if packet.haslayer(RadioTap):
             try:
-                rssi = packet[RadioTap].dBm_AntSignal
+                signal = packet[
+                    RadioTap
+                ].dBm_AntSignal
+
+                if signal is not None:
+                    rssi = signal
+
             except Exception:
                 pass
-                
+
+
+        # ── CHANNEL ───────────────────────────────────
+
         channel = 0
+
         element = packet[Dot11Elt]
-        while element:
-            if element.ID == 3:
-                channel = ord(element.info)
+
+        while isinstance(element, Dot11Elt):
+
+            if element.ID == 3 and element.info:
+                channel = element.info[0]
                 break
+
             element = element.payload
-            
+
+
+        # ── SUPPORTED RATES ───────────────────────────
+
         rates = []
+
         element = packet[Dot11Elt]
-        while element:
-            if element.ID in [1, 50]:
+
+        while isinstance(element, Dot11Elt):
+
+            if element.ID in (1, 50):
+
                 for rate in element.info:
-                    rates.append((rate & 0x7F) * 0.5)
+                    rates.append(
+                        (rate & 0x7F) * 0.5
+                    )
+
             element = element.payload
-        rate_count = len(set(rates))
-        
-        # Security
+
+        rate_count = len(
+            set(rates)
+        )
+
+
+        # ── SECURITY CHARACTERISTICS ──────────────────
+
         security = "Open"
-        has_rsn, has_wpa = False, False
+
+        has_rsn = False
+        has_wpa = False
+
         element = packet[Dot11Elt]
-        while element:
+
+        while isinstance(element, Dot11Elt):
+
             if element.ID == 48:
                 has_rsn = True
-            if element.ID == 221 and element.info[:4] == b'\x00\x50\xf2\x01':
+
+            if (
+                element.ID == 221
+                and element.info[:4]
+                == b"\x00\x50\xf2\x01"
+            ):
                 has_wpa = True
+
             element = element.payload
-        cap = packet[Dot11Beacon].cap
+
+        cap = packet[
+            Dot11Beacon
+        ].cap
+
         if has_rsn:
             security = "WPA2/WPA3"
+
         elif has_wpa:
             security = "WPA"
+
         elif bool(cap & 0x0010):
             security = "WEP"
-            
-        sec_map = {'Open': 0, 'WEP': 1, 'WPA': 2, 'WPA2/WPA3': 3}
-        security_encoded = sec_map.get(security, 0)
-        
-        seq_num = packet[Dot11].SC >> 4
-        beacon_ts = packet[Dot11Beacon].timestamp
-        beacon_int = packet[Dot11Beacon].beacon_interval
-        capabilities = int(cap)
-        
+
+        security_map = {
+            "Open": 0,
+            "WEP": 1,
+            "WPA": 2,
+            "WPA2/WPA3": 3,
+        }
+
+        security_encoded = security_map.get(
+            security,
+            0,
+        )
+
+
+        # ── BASIC BEACON FEATURES ─────────────────────
+
+        seq_num = (
+            packet[Dot11].SC >> 4
+        )
+
+        beacon_timestamp = packet[
+            Dot11Beacon
+        ].timestamp
+
+        beacon_interval = packet[
+            Dot11Beacon
+        ].beacon_interval
+
+        capabilities = int(
+            cap
+        )
+
+
+        # ── INFORMATION ELEMENT COUNT ─────────────────
+
         ie_count = 0
+
         element = packet[Dot11Elt]
-        while element and isinstance(element, Dot11Elt):
+
+        while isinstance(
+            element,
+            Dot11Elt,
+        ):
             ie_count += 1
             element = element.payload
-            
-        # Sequence Jump
+
+
+        # ── SEQUENCE BEHAVIOR ─────────────────────────
+
         seq_jump = 0
-        if bssid in seq_tracker and seq_tracker[bssid]:
-            last_seq = seq_tracker[bssid][-1]
-            if seq_num >= last_seq:
-                seq_jump = seq_num - last_seq
+
+        if (
+            bssid in seq_tracker
+            and seq_tracker[bssid]
+        ):
+
+            previous_seq = (
+                seq_tracker[bssid][-1]
+            )
+
+            if seq_num >= previous_seq:
+
+                seq_jump = (
+                    seq_num
+                    - previous_seq
+                )
+
             else:
-                seq_jump = (4095 - last_seq) + seq_num
+                # Sequence field wraps from 4095 → 0.
+                seq_jump = (
+                    4096
+                    - previous_seq
+                    + seq_num
+                )
+
         if bssid not in seq_tracker:
             seq_tracker[bssid] = []
-        seq_tracker[bssid].append(seq_num)
-        if len(seq_tracker[bssid]) > 20:
-            seq_tracker[bssid].pop(0)
-            
-        seq_anomaly_score = min(1.0, seq_jump / 1000) if seq_jump > 100 else 0.0
-        
-        # ── STABILIZED CLOCK SKEW CALCULATION ────────
-        # Only compute skew if consecutive frames arrived in tight timing window (<250ms)
+
+        seq_tracker[bssid].append(
+            seq_num
+        )
+
+        if len(
+            seq_tracker[bssid]
+        ) > 20:
+
+            seq_tracker[
+                bssid
+            ].pop(0)
+
+        if seq_jump > 100:
+
+            seq_anomaly_score = min(
+                1.0,
+                seq_jump / 1000,
+            )
+
+        else:
+            seq_anomaly_score = 0.0
+
+
+        # ── TIMING / CLOCK-SKEW ESTIMATE ──────────────
+
         skew = 0.0
         valid_skew = False
-        
+
         if bssid not in ts_tracker:
             ts_tracker[bssid] = []
-            
-        ts_tracker[bssid].append({'beacon_ts': beacon_ts, 'sys_ts': system_time})
-        if len(ts_tracker[bssid]) > 20:
-            ts_tracker[bssid].pop(0)
-            
-        if len(ts_tracker[bssid]) >= 2:
-            prev = ts_tracker[bssid][-2]
-            curr = ts_tracker[bssid][-1]
-            time_gap = curr['sys_ts'] - prev['sys_ts']
-            
-            # If frames arrived within 250ms (no channel hop interruption)
+
+        ts_tracker[bssid].append(
+            {
+                "beacon_ts":
+                    beacon_timestamp,
+
+                "sys_ts":
+                    system_time,
+            }
+        )
+
+        if len(
+            ts_tracker[bssid]
+        ) > 20:
+
+            ts_tracker[
+                bssid
+            ].pop(0)
+
+        if len(
+            ts_tracker[bssid]
+        ) >= 2:
+
+            previous = (
+                ts_tracker[bssid][-2]
+            )
+
+            current = (
+                ts_tracker[bssid][-1]
+            )
+
+            time_gap = (
+                current["sys_ts"]
+                - previous["sys_ts"]
+            )
+
+            # Accept timing evidence only when the capture
+            # interval is sufficiently tight to reduce
+            # channel-hop / virtualization jitter.
             if 0.05 <= time_gap <= 0.25:
-                ap_diff = curr['beacon_ts'] - prev['beacon_ts']
-                sys_diff = time_gap * 1_000_000
-                if sys_diff > 0:
-                    skew = (ap_diff - sys_diff) / sys_diff
+
+                ap_difference = (
+                    current["beacon_ts"]
+                    - previous["beacon_ts"]
+                )
+
+                system_difference = (
+                    time_gap
+                    * 1_000_000
+                )
+
+                if system_difference > 0:
+
+                    skew = (
+                        ap_difference
+                        - system_difference
+                    ) / system_difference
+
                     valid_skew = True
-                
-        # Inter-beacon timing
+
+
+        # ── INTER-BEACON ARRIVAL TIME ─────────────────
+
         inter_beacon_ms = 0.0
+
         if bssid in last_seen_bssid:
-            inter_beacon_ms = (system_time - last_seen_bssid[bssid]) * 1000
-        last_seen_bssid[bssid] = system_time
-        
-        # Duplicate sequence check (Simultaneous presence)
-        dup_key = f"{bssid}_{seq_num}"
-        is_seq_dup = 0
-        if dup_key in last_seen_seq:
-            # If the EXACT same sequence number was seen from this BSSID within 500ms
-            if 0.001 < (system_time - last_seen_seq[dup_key]) < 0.5:
-                is_seq_dup = 1
-        last_seen_seq[dup_key] = system_time
-        
+
+            inter_beacon_ms = (
+                system_time
+                - last_seen_bssid[bssid]
+            ) * 1000
+
+        last_seen_bssid[
+            bssid
+        ] = system_time
+
+
+        # ── DUPLICATE SEQUENCE OBSERVATION ────────────
+
+        duplicate_key = (
+            f"{bssid}_{seq_num}"
+        )
+
+        is_seq_duplicate = 0
+
+        if duplicate_key in last_seen_seq:
+
+            duplicate_gap = (
+                system_time
+                - last_seen_seq[
+                    duplicate_key
+                ]
+            )
+
+            # Duplicate sequence activity in a short
+            # interval is treated as strong suspicious
+            # evidence, not absolute proof of two radios.
+            if (
+                0.001
+                < duplicate_gap
+                < 0.5
+            ):
+                is_seq_duplicate = 1
+
+        last_seen_seq[
+            duplicate_key
+        ] = system_time
+
+
         return {
-            'ssid': ssid, 'bssid': bssid, 'rssi': rssi, 'channel': channel,
-            'seq_num': seq_num, 'seq_jump': seq_jump, 'seq_anomaly_score': round(seq_anomaly_score, 4),
-            'beacon_timestamp': beacon_ts, 'clock_skew': round(skew, 8), 'valid_skew': valid_skew,
-            'beacon_interval': beacon_int, 'capabilities': capabilities,
-            'security': security, 'security_encoded': security_encoded,
-            'ie_count': ie_count, 'rate_count': rate_count,
-            'inter_beacon_ms': inter_beacon_ms, 'is_seq_duplicate': is_seq_dup
+            "ssid":
+                ssid,
+
+            "bssid":
+                bssid,
+
+            "rssi":
+                rssi,
+
+            "channel":
+                channel,
+
+            "seq_num":
+                seq_num,
+
+            "seq_jump":
+                seq_jump,
+
+            "seq_anomaly_score":
+                round(
+                    seq_anomaly_score,
+                    4,
+                ),
+
+            "beacon_timestamp":
+                beacon_timestamp,
+
+            "clock_skew":
+                round(
+                    skew,
+                    8,
+                ),
+
+            "valid_skew":
+                valid_skew,
+
+            "beacon_interval":
+                beacon_interval,
+
+            "capabilities":
+                capabilities,
+
+            "security":
+                security,
+
+            "security_encoded":
+                security_encoded,
+
+            "ie_count":
+                ie_count,
+
+            "rate_count":
+                rate_count,
+
+            "inter_beacon_ms":
+                inter_beacon_ms,
+
+            "is_seq_duplicate":
+                is_seq_duplicate,
         }
+
     except Exception:
         return None
 
+
 # ─────────────────────────────────────────────────────
-# CALIBRATED MULTI-LAYER EVALUATOR
+# MULTI-LAYER EVALUATOR
 # ─────────────────────────────────────────────────────
 
 def evaluate_packet(feat):
-    bssid = feat['bssid']
-    ssid = feat['ssid']
-    
+    """
+    Compare one beacon observation against known AP
+    profiles and anomaly models.
+
+    Returns
+    -------
+    tuple
+        (
+            is_suspicious,
+            evidence_reasons,
+            threat_score
+        )
+
+    The threat score is heuristic and is not a calibrated
+    attack probability.
+    """
+
+    bssid = feat[
+        "bssid"
+    ]
+
+    ssid = feat[
+        "ssid"
+    ]
+
     matched_profile = None
     target_bssid = None
-    
-    # 1. Profile Lookup
-    if bssid in bssid_profiles:
-        matched_profile = bssid_profiles[bssid]
-        target_bssid = bssid
-    else:
-        # Check if an attacker is broadcasting a known SSID on a fake MAC
-        for pb, prof in bssid_profiles.items():
-            if prof['ssid'].lower() == ssid.lower() and ssid != "<Hidden>":
-                matched_profile = prof
-                target_bssid = pb
-                break
-                
-    if not matched_profile:
-        return False, [], 0.0  # Unprofiled network
 
-    threat_reasons = []
-    hard_evidence_count = 0
+
+    # ── PROFILE LOOKUP ────────────────────────────────
+
+    if bssid in bssid_profiles:
+
+        matched_profile = (
+            bssid_profiles[bssid]
+        )
+
+        target_bssid = bssid
+
+    else:
+
+        # Search for an already-profiled AP advertising
+        # the same SSID from a different BSSID.
+        for (
+            profiled_bssid,
+            profile,
+        ) in bssid_profiles.items():
+
+            if (
+                profile["ssid"].lower()
+                == ssid.lower()
+                and ssid != "<Hidden>"
+            ):
+
+                matched_profile = (
+                    profile
+                )
+
+                target_bssid = (
+                    profiled_bssid
+                )
+
+                break
+
+
+    # Ignore APs that are not represented in the
+    # current baseline.
+    if not matched_profile:
+
+        return (
+            False,
+            [],
+            0.0,
+        )
+
+
+    evidence_reasons = []
+
+    strong_evidence_count = 0
+
     threat_score = 0.0
 
-    # ── HARD EVIDENCE 1: Simultaneous Presence / Duplicate Sequence ──
-    if feat['is_seq_duplicate'] == 1:
+
+    # ── STRONG EVIDENCE 1:
+    # SHORT-INTERVAL DUPLICATE SEQUENCE ACTIVITY
+    # ─────────────────────────────────────────────────
+
+    if (
+        feat[
+            "is_seq_duplicate"
+        ]
+        == 1
+    ):
+
         threat_score += 0.90
-        hard_evidence_count += 1
-        threat_reasons.append(f"CRITICAL: Duplicate sequence number ({feat['seq_num']}) seen simultaneously. Two transmitters are using this BSSID.")
 
-    # ── HARD EVIDENCE 2: Rogue MAC with Cloned SSID ──────────────────
+        strong_evidence_count += 1
+
+        evidence_reasons.append(
+            "Duplicate sequence activity: "
+            f"sequence {feat['seq_num']} "
+            "was observed again for the same "
+            "BSSID within the configured "
+            "short timing window."
+        )
+
+
+    # ── STRONG EVIDENCE 2:
+    # KNOWN SSID FROM DIFFERENT BSSID
+    # ─────────────────────────────────────────────────
+
     if bssid != target_bssid:
+
         threat_score += 0.85
-        hard_evidence_count += 1
-        threat_reasons.append(f"Rogue BSSID: Spoofing SSID '{ssid}' using unregistered MAC {bssid} (Legitimate: {target_bssid})")
 
-    # ── HARD EVIDENCE 3: Major Structural IE Discrepancy ────────────
-    # Allow tolerance of ±2 for normal router dynamic updates
-    ie_diff = abs(feat['ie_count'] - matched_profile['ie_count'])
-    if ie_diff >= 3:
+        strong_evidence_count += 1
+
+        evidence_reasons.append(
+            "SSID/BSSID inconsistency: "
+            f"known SSID '{ssid}' observed from "
+            f"{bssid}; profiled BSSID is "
+            f"{target_bssid}."
+        )
+
+
+    # ── STRONG EVIDENCE 3:
+    # BEACON IE STRUCTURAL DEVIATION
+    # ─────────────────────────────────────────────────
+
+    ie_difference = abs(
+        feat[
+            "ie_count"
+        ]
+        - matched_profile[
+            "ie_count"
+        ]
+    )
+
+    # Allow small structural variation in this
+    # prototype before treating the observation
+    # as strong evidence.
+    if ie_difference >= 3:
+
         threat_score += 0.70
-        hard_evidence_count += 1
-        threat_reasons.append(f"Hardware IE Structural Mismatch: Transmitted {feat['ie_count']} IEs (Baseline: {matched_profile['ie_count']}, Δ={ie_diff})")
 
-    # ── HARD EVIDENCE 4: Security Alteration ─────────────────────────
-    if feat['security'] != matched_profile['security']:
+        strong_evidence_count += 1
+
+        evidence_reasons.append(
+            "Beacon IE count deviation: "
+            f"observed {feat['ie_count']} "
+            "Information Elements; "
+            f"baseline {matched_profile['ie_count']} "
+            f"(Δ={ie_difference})."
+        )
+
+
+    # ── STRONG EVIDENCE 4:
+    # SECURITY CHARACTERISTIC CHANGE
+    # ─────────────────────────────────────────────────
+
+    if (
+        feat["security"]
+        != matched_profile[
+            "security"
+        ]
+    ):
+
         threat_score += 0.60
-        hard_evidence_count += 1
-        threat_reasons.append(f"Security Protocol Alteration: {feat['security']} (Baseline: {matched_profile['security']})")
 
-    # ── SOFT EVIDENCE 1: Chipset Rate Set ────────────────────────────
-    if abs(feat['rate_count'] - matched_profile['rate_count']) >= 3:
+        strong_evidence_count += 1
+
+        evidence_reasons.append(
+            "Advertised security change: "
+            f"observed {feat['security']}; "
+            "baseline "
+            f"{matched_profile['security']}."
+        )
+
+
+    # ── SUPPORTING EVIDENCE 1:
+    # SUPPORTED-RATE DEVIATION
+    # ─────────────────────────────────────────────────
+
+    rate_difference = abs(
+        feat[
+            "rate_count"
+        ]
+        - matched_profile[
+            "rate_count"
+        ]
+    )
+
+    if rate_difference >= 3:
+
         threat_score += 0.30
-        threat_reasons.append(f"Chipset Rate Discrepancy: {feat['rate_count']} rates (Baseline: {matched_profile['rate_count']})")
 
-    # ── SOFT EVIDENCE 2: Validated Clock Skew Drift ──────────────────
-    if feat['valid_skew'] and matched_profile['clock_skew_std'] > 0:
-        z_skew = abs(feat['clock_skew'] - matched_profile['clock_skew_mean']) / matched_profile['clock_skew_std']
-        # Only evaluate if we have a stable measurement
-        if z_skew > 10.0 and abs(feat['clock_skew']) > 0.0005:
+        evidence_reasons.append(
+            "Supported-rate deviation: "
+            f"observed {feat['rate_count']} "
+            "unique rates; "
+            f"baseline "
+            f"{matched_profile['rate_count']}."
+        )
+
+
+    # ── SUPPORTING EVIDENCE 2:
+    # TIMING / CLOCK-SKEW DEVIATION
+    # ─────────────────────────────────────────────────
+
+    profile_skew_std = matched_profile.get(
+        "clock_skew_std",
+        0,
+    )
+
+    if (
+        feat[
+            "valid_skew"
+        ]
+        and profile_skew_std > 0
+    ):
+
+        profile_skew_mean = (
+            matched_profile.get(
+                "clock_skew_mean",
+                0,
+            )
+        )
+
+        z_skew = abs(
+            feat[
+                "clock_skew"
+            ]
+            - profile_skew_mean
+        ) / profile_skew_std
+
+        if (
+            z_skew > 10.0
+            and abs(
+                feat[
+                    "clock_skew"
+                ]
+            ) > 0.0005
+        ):
+
             threat_score += 0.35
-            threat_reasons.append(f"Hardware Clock Drift: Skew {feat['clock_skew']:.6f} deviates from physical crystal profile ({z_skew:.1f}σ)")
 
-    # ── SOFT EVIDENCE 3: Per-BSSID ML Model ──────────────────────────
-    if target_bssid in per_bssid_bundle['models'] and feat['valid_skew']:
-        model = per_bssid_bundle['models'][target_bssid]
-        scaler = per_bssid_bundle['scalers'][target_bssid]
-        features_order = per_bssid_bundle['features']
-        
-        X_raw = np.array([[feat.get(f, 0.0) for f in features_order]])
-        X_scaled = scaler.transform(X_raw)
-        
-        ml_score = model.decision_function(X_scaled)[0]
-        # Only flag if heavily anomalous
-        if ml_score < -0.12:
+            evidence_reasons.append(
+                "Timing deviation: "
+                f"clock-skew estimate "
+                f"{feat['clock_skew']:.6f} "
+                "differs strongly from the "
+                "profiled timing baseline "
+                f"({z_skew:.1f}σ)."
+            )
+
+
+    # ── SUPPORTING EVIDENCE 3:
+    # PER-BSSID ISOLATION FOREST
+    # ─────────────────────────────────────────────────
+
+    models = per_bssid_bundle.get(
+        "models",
+        {},
+    )
+
+    scalers = per_bssid_bundle.get(
+        "scalers",
+        {},
+    )
+
+    features_order = (
+        per_bssid_bundle.get(
+            "features",
+            [],
+        )
+    )
+
+    if (
+        target_bssid in models
+        and target_bssid in scalers
+        and features_order
+        and feat["valid_skew"]
+    ):
+
+        model = models[
+            target_bssid
+        ]
+
+        scaler = scalers[
+            target_bssid
+        ]
+
+        raw_features = np.array(
+            [
+                [
+                    feat.get(
+                        feature,
+                        0.0,
+                    )
+                    for feature
+                    in features_order
+                ]
+            ]
+        )
+
+        scaled_features = (
+            scaler.transform(
+                raw_features
+            )
+        )
+
+        anomaly_score = (
+            model.decision_function(
+                scaled_features
+            )[0]
+        )
+
+        # Threshold retained from the current
+        # prototype calibration.
+        if anomaly_score < -0.12:
+
             threat_score += 0.25
-            threat_reasons.append(f"Per-BSSID AI Anomaly: Deviation score {ml_score:.3f}")
 
-    # DECISION LOGIC:
-    # Must have either at least 1 piece of HARD evidence OR threat_score >= 0.75
-    is_suspicious = (hard_evidence_count >= 1) or (threat_score >= 0.75)
-    
-    return is_suspicious, threat_reasons, min(1.0, threat_score)
+            evidence_reasons.append(
+                "Per-BSSID anomaly model: "
+                f"Isolation Forest decision "
+                f"score {anomaly_score:.3f} "
+                "fell below the configured "
+                "prototype threshold."
+            )
+
+
+    # ── DECISION LOGIC ────────────────────────────────
+
+    # Current prototype policy:
+    # - at least one strong evidence condition
+    #   OR
+    # - aggregated score >= 0.75
+    is_suspicious = (
+        strong_evidence_count >= 1
+        or threat_score >= 0.75
+    )
+
+    return (
+        is_suspicious,
+        evidence_reasons,
+        min(
+            1.0,
+            threat_score,
+        ),
+    )
+
 
 # ─────────────────────────────────────────────────────
-# ALERT DISPATCHER (WITH MULTI-FRAME CONFIRMATION)
+# ALERT DISPATCHER
 # ─────────────────────────────────────────────────────
 
-def handle_detection(feat, is_suspicious, reasons, confidence):
+def handle_detection(
+    feat,
+    is_suspicious,
+    reasons,
+    threat_score,
+):
+    """
+    Apply streak confirmation and cooldown before
+    generating a detector alert.
+    """
+
     global alert_count
-    bssid = feat['bssid']
+
+    bssid = feat[
+        "bssid"
+    ]
+
     now = time.time()
-    
+
+
     if is_suspicious:
-        suspicious_streak[bssid] = suspicious_streak.get(bssid, 0) + 1
-        
-        # Check if confirmed across multiple frames
-        if suspicious_streak[bssid] >= REQUIRED_STREAK:
-            if bssid in alert_cooldown and (now - alert_cooldown[bssid]) < ALERT_COOLDOWN_SEC:
+
+        suspicious_streak[
+            bssid
+        ] = (
+            suspicious_streak.get(
+                bssid,
+                0,
+            )
+            + 1
+        )
+
+
+        if (
+            suspicious_streak[
+                bssid
+            ]
+            >= REQUIRED_STREAK
+        ):
+
+            if (
+                bssid
+                in alert_cooldown
+                and (
+                    now
+                    - alert_cooldown[
+                        bssid
+                    ]
+                )
+                < ALERT_COOLDOWN_SEC
+            ):
                 return
-                
-            alert_cooldown[bssid] = now
+
+
+            alert_cooldown[
+                bssid
+            ] = now
+
             alert_count += 1
-            
-            RED    = "\033[91m"
+
+
+            RED = "\033[91m"
             YELLOW = "\033[93m"
-            BOLD   = "\033[1m"
-            RESET  = "\033[0m"
-            
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            print("\n" + f"{RED}{'='*70}{RESET}")
-            print(f"{RED}{BOLD}  🚨 [ALERT #{alert_count}] EVIL TWIN ATTACK CONFIRMED! 🚨{RESET}")
-            print(f"{RED}{'='*70}{RESET}")
-            print(f"  {BOLD}Timestamp   :{RESET} {timestamp}")
-            print(f"  {BOLD}Target SSID :{RESET} {feat['ssid']}")
-            print(f"  {BOLD}Rogue BSSID :{RESET} {feat['bssid']}")
-            print(f"  {BOLD}Channel     :{RESET} {feat['channel']} | {BOLD}RSSI:{RESET} {feat['rssi']} dBm")
-            print(f"  {BOLD}AI Confidence Score :{RESET} {RED}{confidence*100:.1f}%{RESET}")
-            print(f"{YELLOW}{'-'*70}{RESET}")
-            print(f"  {BOLD}Confirmed Forensic Evidence:{RESET}")
-            for idx, reason in enumerate(reasons, 1):
-                print(f"   {RED}[{idx}]{RESET} {reason}")
-            print(f"{RED}{'='*70}{RESET}\n")
-            
-            os.makedirs(config.LOGS_DIR, exist_ok=True)
-            with open(config.ALERT_LOG_FILE, 'a') as f:
-                f.write(f"[{timestamp}] ALERT #{alert_count} | SSID: {feat['ssid']} | BSSID: {feat['bssid']} | Score: {confidence*100:.1f}%\n")
-                for r in reasons:
-                    f.write(f"  - {r}\n")
-                f.write("\n")
+            BOLD = "\033[1m"
+            RESET = "\033[0m"
+
+
+            timestamp = (
+                datetime.datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            )
+
+
+            print(
+                "\n"
+                + f"{RED}"
+                + "=" * 70
+                + f"{RESET}"
+            )
+
+            print(
+                f"{RED}{BOLD}"
+                f"  🚨 [ALERT #{alert_count}] "
+                "SUSPICIOUS ACCESS POINT "
+                f"ACTIVITY DETECTED 🚨"
+                f"{RESET}"
+            )
+
+            print(
+                f"{RED}"
+                + "=" * 70
+                + f"{RESET}"
+            )
+
+            print(
+                f"  {BOLD}Timestamp    :"
+                f"{RESET} {timestamp}"
+            )
+
+            print(
+                f"  {BOLD}Observed SSID:"
+                f"{RESET} {feat['ssid']}"
+            )
+
+            print(
+                f"  {BOLD}Observed BSSID:"
+                f"{RESET} {feat['bssid']}"
+            )
+
+            print(
+                f"  {BOLD}Channel      :"
+                f"{RESET} {feat['channel']} | "
+                f"{BOLD}RSSI:"
+                f"{RESET} {feat['rssi']} dBm"
+            )
+
+            print(
+                f"  {BOLD}Threat Score :"
+                f"{RESET} "
+                f"{RED}"
+                f"{threat_score * 100:.1f}/100"
+                f"{RESET}"
+            )
+
+            print(
+                f"{YELLOW}"
+                + "-" * 70
+                + f"{RESET}"
+            )
+
+            print(
+                f"  {BOLD}"
+                "Detection Evidence:"
+                f"{RESET}"
+            )
+
+
+            for (
+                index,
+                reason,
+            ) in enumerate(
+                reasons,
+                1,
+            ):
+
+                print(
+                    f"   {RED}"
+                    f"[{index}]"
+                    f"{RESET} "
+                    f"{reason}"
+                )
+
+
+            print(
+                f"{RED}"
+                + "=" * 70
+                + f"{RESET}\n"
+            )
+
+
+            os.makedirs(
+                config.LOGS_DIR,
+                exist_ok=True,
+            )
+
+
+            with open(
+                config.ALERT_LOG_FILE,
+                "a",
+                encoding="utf-8",
+            ) as file:
+
+                file.write(
+                    f"[{timestamp}] "
+                    f"ALERT #{alert_count} | "
+                    f"SSID: {feat['ssid']} | "
+                    f"BSSID: {feat['bssid']} | "
+                    "Threat Score: "
+                    f"{threat_score * 100:.1f}/100\n"
+                )
+
+                for reason in reasons:
+
+                    file.write(
+                        f"  - {reason}\n"
+                    )
+
+                file.write(
+                    "\n"
+                )
+
+
     else:
-        # Reset streak if frame is clean
-        suspicious_streak[bssid] = 0
+
+        # A benign observation resets the
+        # consecutive-suspicion streak.
+        suspicious_streak[
+            bssid
+        ] = 0
+
 
 # ─────────────────────────────────────────────────────
-# PACKET CONSUMER & HOPPER
+# PACKET CONSUMER
 # ─────────────────────────────────────────────────────
 
 def packet_consumer(packet):
-    global packet_count
-    
-    if not packet.haslayer(Dot11Beacon):
-        return
-        
-    feat = extract_features(packet, time.time())
-    if not feat:
-        return
-        
-    packet_count += 1
-    
-    is_suspicious, reasons, confidence = evaluate_packet(feat)
-    handle_detection(feat, is_suspicious, reasons, confidence)
-    
-    if not is_suspicious and packet_count % 20 == 0:
-        print(f"\r  [🛡️ Active Monitor] Packets: {packet_count:5d} | Alerts: {alert_count:2d} | Validating: {feat['ssid'][:18]:<18} ({feat['bssid']})", end='', flush=True)
+    """
+    Process captured beacon frames.
+    """
 
-def channel_cycler(interface, locked_channel=None):
+    global packet_count
+
+
+    if not packet.haslayer(
+        Dot11Beacon
+    ):
+        return
+
+
+    features = extract_features(
+        packet,
+        time.time(),
+    )
+
+
+    if not features:
+        return
+
+
+    packet_count += 1
+
+
+    (
+        is_suspicious,
+        reasons,
+        threat_score,
+    ) = evaluate_packet(
+        features
+    )
+
+
+    handle_detection(
+        features,
+        is_suspicious,
+        reasons,
+        threat_score,
+    )
+
+
+    if (
+        not is_suspicious
+        and packet_count % 20 == 0
+    ):
+
+        print(
+            "\r"
+            "  [🛡️ Active Monitor] "
+            f"Packets: {packet_count:5d} | "
+            f"Alerts: {alert_count:2d} | "
+            "Evaluating: "
+            f"{features['ssid'][:18]:<18} "
+            f"({features['bssid']})",
+            end="",
+            flush=True,
+        )
+
+
+# ─────────────────────────────────────────────────────
+# CHANNEL CONTROL
+# ─────────────────────────────────────────────────────
+
+def channel_cycler(
+    interface,
+    locked_channel=None,
+):
+    """
+    Lock to one channel or cycle through configured
+    wireless channels.
+    """
+
     global hop_running
+
+
     if locked_channel:
-        os.system(f"iwconfig {interface} channel {locked_channel} 2>/dev/null")
+
+        os.system(
+            f"iwconfig {interface} "
+            f"channel {locked_channel} "
+            "2>/dev/null"
+        )
+
         while hop_running:
             time.sleep(5)
+
+
     else:
+
         while hop_running:
-            for ch in config.ALL_CHANNELS:
+
+            for channel in config.ALL_CHANNELS:
+
                 if not hop_running:
                     break
-                os.system(f"iwconfig {interface} channel {ch} 2>/dev/null")
-                time.sleep(config.HOP_INTERVAL)
+
+                os.system(
+                    f"iwconfig {interface} "
+                    f"channel {channel} "
+                    "2>/dev/null"
+                )
+
+                time.sleep(
+                    config.HOP_INTERVAL
+                )
+
 
 # ─────────────────────────────────────────────────────
-# ENTRYPOINT
+# ENTRY POINT
 # ─────────────────────────────────────────────────────
 
-def start_detection(interface, target_network=None):
-    global detection_running, hop_running, packet_count, alert_count, suspicious_streak
-    
+def start_detection(
+    interface,
+    target_network=None,
+):
+    """
+    Start passive Evil Twin / rogue AP monitoring.
+    """
+
+    global detection_running
+    global hop_running
+    global packet_count
+    global alert_count
+    global suspicious_streak
+
+
     packet_count = 0
     alert_count = 0
+
     suspicious_streak.clear()
-    
-    print("\n[*] Initializing Detection Engine & Loading Models...")
+
+
+    print(
+        "\n[*] Initializing hybrid "
+        "wireless detection engine..."
+    )
+
+
     if not load_resources():
         return
-        
-    locked_ch = target_network.get('channel') if target_network else None
-    
-    print("\n" + "="*70)
-    print("  🛡️  AI-ENABLED ROGUE AP & EVIL TWIN REAL-TIME DEFENSE")
-    print("="*70)
-    print(f"  Interface      : {interface}")
-    print(f"  Protected Base : {len(bssid_profiles)} AP Fingerprints")
-    print(f"  Channel Mode   : {'Locked on CH ' + str(locked_ch) if locked_ch else 'Channel Hopping (All BSSIDs)'}")
-    print(f"  Alert Log      : {config.ALERT_LOG_FILE}")
-    print("="*70)
-    print("  Listening for 802.11 Beacon frames... Press Ctrl+C to halt.\n")
-    
+
+
+    locked_channel = (
+        target_network.get(
+            "channel"
+        )
+        if target_network
+        else None
+    )
+
+
+    print(
+        "\n"
+        + "=" * 70
+    )
+
+    print(
+        "  🛡️ HYBRID ROGUE AP & "
+        "EVIL TWIN WIRELESS MONITOR"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        f"  Interface       : "
+        f"{interface}"
+    )
+
+    print(
+        f"  AP Profiles     : "
+        f"{len(bssid_profiles)}"
+    )
+
+    print(
+        "  Channel Mode    : "
+        + (
+            "Locked on CH "
+            f"{locked_channel}"
+            if locked_channel
+            else
+            "Channel Hopping "
+            "(All Configured Channels)"
+        )
+    )
+
+    print(
+        f"  Alert Log       : "
+        f"{config.ALERT_LOG_FILE}"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print(
+        "  Listening for 802.11 "
+        "beacon frames..."
+    )
+
+    print(
+        "  Press Ctrl+C to halt.\n"
+    )
+
+
     hop_running = True
-    hopper = threading.Thread(target=channel_cycler, args=(interface, locked_ch), daemon=True)
+
+
+    hopper = threading.Thread(
+        target=channel_cycler,
+        args=(
+            interface,
+            locked_channel,
+        ),
+        daemon=True,
+    )
+
     hopper.start()
-    
+
+
     detection_running = True
+
+
     try:
-        sniff(iface=interface, prn=packet_consumer, store=False)
+
+        sniff(
+            iface=interface,
+            prn=packet_consumer,
+            store=False,
+        )
+
+
     except KeyboardInterrupt:
+
         pass
+
+
     finally:
+
         hop_running = False
         detection_running = False
-        print(f"\n\n{'='*70}")
-        print("  DETECTION AUDIT FINISHED")
-        print(f"  Total Packets Evaluated: {packet_count}")
-        print(f"  Attacks Intercepted    : {alert_count}")
-        print(f"  Log File               : {config.ALERT_LOG_FILE}")
-        print(f"{'='*70}\n")
+
+
+        print(
+            "\n\n"
+            + "=" * 70
+        )
+
+        print(
+            "  DETECTION SESSION FINISHED"
+        )
+
+        print(
+            f"  Total Beacons Evaluated: "
+            f"{packet_count}"
+        )
+
+        print(
+            f"  Alerts Generated       : "
+            f"{alert_count}"
+        )
+
+        print(
+            f"  Log File               : "
+            f"{config.ALERT_LOG_FILE}"
+        )
+
+        print(
+            "=" * 70
+            + "\n"
+        )
