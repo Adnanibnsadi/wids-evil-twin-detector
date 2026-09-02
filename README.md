@@ -301,8 +301,8 @@ wids-evil-twin-detector/
 │   ├── profiler.py
 │   ├── simulator.py
 │   ├── trainer.py
-│   ├── detector.py
-│   └── alerter.py
+│   └── detector.py
+│   
 │
 ├── scripts/
 │   ├── sniffer.py
