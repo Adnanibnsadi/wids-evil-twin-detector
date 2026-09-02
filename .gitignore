@@ -16,4 +16,6 @@ models/*.pkl
 !models/.gitkeep
 
 SANITIZE_MAP_DO_NOT_COMMIT.json
+SANITIZE_PRIVATE_INPUT.json
+
 .DS_Store
