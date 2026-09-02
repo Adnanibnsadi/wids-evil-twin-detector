@@ -313,9 +313,9 @@ wids-evil-twin-detector/
 │   └── sanitize_for_public.py
 │
 ├── data/
-│   ├── samples/
-│   │   └── bssid_profiles.example.json
-│   └── vendor_database.json
+│   └── samples/
+│       └── bssid_profiles.example.json
+│   
 │
 ├── models/
 │   └── .gitkeep
