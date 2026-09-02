@@ -1,6 +1,7 @@
 # 🛡️ Hybrid WIDS: Evil Twin & Rogue Access Point Detector
 
 > **Version 0.8 — Research Prototype / Working Lab System**
+> [![Tests](https://github.com/Adnanibnsadi/wids-evil-twin-detector/actions/workflows/tests.yml/badge.svg)](https://github.com/Adnanibnsadi/wids-evil-twin-detector/actions/workflows/tests.yml)
 
 A passive wireless intrusion detection system for Linux that profiles nearby IEEE 802.11 access points and detects suspicious or BSSID-spoofed access points using a combination of:
 
