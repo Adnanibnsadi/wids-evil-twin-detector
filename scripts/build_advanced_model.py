@@ -1,347 +1,963 @@
 #!/usr/bin/env python3
 """
 =======================================================
-  build_advanced_model.py
-  
-  Trains an advanced AI model using:
-  1. Per-BSSID behavioral profiles
-  2. Isolation Forest for anomaly detection
-  3. Random Forest for classification
-  
-  This model can detect PERFECT Evil Twins because
-  it uses unfakeable hardware fingerprints.
+ scripts/build_advanced_model.py
+=======================================================
+
+Build behavioral anomaly-detection models from legitimate
+802.11 beacon observations.
+
+Current model architecture:
+
+1. Per-BSSID Isolation Forest models
+   - Learn the behavioral baseline of individual APs.
+
+2. Experimental global Isolation Forest
+   - Learns broader deviation patterns across profiled APs.
+
+The training dataset is expected to contain legitimate /
+baseline traffic rather than labeled attack samples.
+
+These models provide anomaly evidence. They do not by
+themselves prove that an Evil Twin or rogue AP is present.
 =======================================================
 """
 
-import pandas as pd
-import numpy as np
 import json
 import os
 import sys
+
 import joblib
-import warnings
-warnings.filterwarnings('ignore')
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
 
-from sklearn.ensemble        import IsolationForest, RandomForestClassifier
-from sklearn.preprocessing   import StandardScaler
-from sklearn.model_selection import cross_val_score
-from sklearn.metrics         import classification_report
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Allow imports from the project root.
+sys.path.insert(
+    0,
+    os.path.dirname(
+        os.path.dirname(
+            os.path.abspath(__file__)
+        )
+    ),
+)
+
 import config
+
+
+# Prototype calibration value.
+#
+# In Isolation Forest, contamination influences the
+# threshold used to separate typical and atypical training
+# observations. This value should be validated against
+# independent benign sessions in future evaluation.
+CONTAMINATION = 0.05
+
+
+# =======================================================
+# DATA LOADING
+# =======================================================
 
 def load_and_prepare_data():
     """
-    Load all_aps_normal.csv and prepare for training.
-    Creates features that focus on unfakeable characteristics.
+    Load the multi-AP benign dataset and normalize columns.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Cleaned beacon observations.
     """
-    print("[*] Loading dataset...")
-    
-    df = pd.read_csv(config.ALL_APS_DATA_FILE)
-    df = df[df['ssid'] != 'ssid']
-    
-    # Convert numeric columns
+
+    print("[*] Loading baseline dataset...")
+
+    if not os.path.exists(config.ALL_APS_DATA_FILE):
+        raise FileNotFoundError(
+            "Baseline dataset not found: "
+            f"{config.ALL_APS_DATA_FILE}"
+        )
+
+    df = pd.read_csv(
+        config.ALL_APS_DATA_FILE
+    )
+
+    if "ssid" not in df.columns:
+        raise ValueError(
+            "Dataset does not contain the required "
+            "'ssid' column."
+        )
+
+    if "bssid" not in df.columns:
+        raise ValueError(
+            "Dataset does not contain the required "
+            "'bssid' column."
+        )
+
+    # Defensive cleanup in case a CSV header was
+    # accidentally repeated inside the dataset.
+    df = df[
+        df["ssid"].astype(str) != "ssid"
+    ].copy()
+
+    # Normalize BSSID text for reliable dictionary lookup.
+    df["bssid"] = (
+        df["bssid"]
+        .astype(str)
+        .str.lower()
+    )
+
     numeric_cols = [
-        'rssi', 'channel', 'seq_jump', 'seq_anomaly_score',
-        'clock_skew', 'inter_beacon_ms', 'timing_variance',
-        'ie_count', 'rate_count', 'capabilities',
-        'beacon_interval', 'security_encoded',
-        'is_seq_duplicate', 'seq_dup_delta'
+        "rssi",
+        "channel",
+        "seq_jump",
+        "seq_anomaly_score",
+        "clock_skew",
+        "inter_beacon_ms",
+        "timing_variance",
+        "ie_count",
+        "rate_count",
+        "capabilities",
+        "beacon_interval",
+        "security_encoded",
+        "is_seq_duplicate",
+        "seq_dup_delta",
     ]
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-    
-    print(f"[✓] Loaded {len(df):,} rows from {df['bssid'].nunique()} APs")
+
+    for column in numeric_cols:
+
+        if column in df.columns:
+
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce",
+            ).fillna(0)
+
+    print(
+        f"[✓] Loaded {len(df):,} rows from "
+        f"{df['bssid'].nunique()} unique BSSIDs"
+    )
+
     return df
 
 
-def engineer_features(df):
+# =======================================================
+# PROFILE LOADING
+# =======================================================
+
+def load_profiles():
     """
-    Create advanced features for better detection.
-    
-    Key insight: We create features that measure
-    HOW MUCH each beacon deviates from the known
-    profile of its claimed BSSID.
-    
-    This means:
-    - Legitimate AP  → deviation is small   → label 0
-    - Evil Twin      → deviation is large   → label 1
-    
-    Even a PERFECT Evil Twin will show large
-    clock skew deviation because its hardware
-    clock is different from the real AP.
+    Load behavioral profiles and normalize BSSID keys.
+
+    Returns
+    -------
+    dict
+        Mapping of lowercase BSSID -> AP profile.
     """
-    print("[*] Engineering advanced features...")
-    
-    # Load BSSID profiles
-    with open(config.BSSID_PROFILES_FILE, 'r') as f:
-        profiles = json.load(f)
-    
-    # Features that directly compare to known profile
-    df['clock_skew_deviation']  = 0.0  # How far skew is from known mean
-    df['rssi_deviation']        = 0.0  # How far RSSI is from known range
-    df['ie_count_match']        = 1    # Does IE count match profile?
-    df['rate_count_match']      = 1    # Does rate count match profile?
-    df['security_match']        = 1    # Does security match profile?
-    df['channel_match']         = 1    # Does channel match profile?
-    
-    for idx, row in df.iterrows():
-        bssid = row['bssid']
+
+    if not os.path.exists(
+        config.BSSID_PROFILES_FILE
+    ):
+
+        raise FileNotFoundError(
+            "BSSID profiles not found: "
+            f"{config.BSSID_PROFILES_FILE}\n"
+            "Run scripts/build_profiles.py first."
+        )
+
+    with open(
+        config.BSSID_PROFILES_FILE,
+        "r",
+        encoding="utf-8",
+    ) as file:
+
+        raw_profiles = json.load(
+            file
+        )
+
+    profiles = {
+        str(bssid).lower(): profile
+        for bssid, profile
+        in raw_profiles.items()
+    }
+
+    print(
+        f"[✓] Loaded {len(profiles)} "
+        "BSSID behavioral profiles"
+    )
+
+    return profiles
+
+
+# =======================================================
+# FEATURE ENGINEERING
+# =======================================================
+
+def engineer_features(
+    df,
+    profiles,
+):
+    """
+    Create profile-relative features.
+
+    These engineered values describe how much each
+    observation differs from the baseline associated
+    with its claimed BSSID.
+
+    They are behavioral / structural indicators and
+    should not be interpreted as immutable physical
+    hardware identifiers.
+    """
+
+    print(
+        "[*] Engineering profile-relative features..."
+    )
+
+    df = df.copy()
+
+    df[
+        "clock_skew_deviation"
+    ] = 0.0
+
+    df[
+        "rssi_deviation"
+    ] = 0.0
+
+    df[
+        "ie_count_match"
+    ] = 1
+
+    df[
+        "rate_count_match"
+    ] = 1
+
+    df[
+        "security_match"
+    ] = 1
+
+    df[
+        "channel_match"
+    ] = 1
+
+
+    for index, row in df.iterrows():
+
+        bssid = str(
+            row["bssid"]
+        ).lower()
+
         if bssid not in profiles:
             continue
-        
-        p = profiles[bssid]
-        
-        # Clock skew deviation (KEY FEATURE - unfakeable)
-        # How many standard deviations away from known skew?
-        if p['clock_skew_std'] > 0:
-            deviation = abs(
-                row['clock_skew'] - p['clock_skew_mean']
-            ) / p['clock_skew_std']
-        else:
-            deviation = abs(
-                row['clock_skew'] - p['clock_skew_mean']
+
+        profile = profiles[
+            bssid
+        ]
+
+
+        # -----------------------------------------------
+        # Clock-skew deviation
+        # -----------------------------------------------
+
+        skew_mean = float(
+            profile.get(
+                "clock_skew_mean",
+                0.0,
             )
-        df.at[idx, 'clock_skew_deviation'] = deviation
-        
+        )
+
+        skew_std = float(
+            profile.get(
+                "clock_skew_std",
+                0.0,
+            )
+        )
+
+        observed_skew = float(
+            row.get(
+                "clock_skew",
+                0.0,
+            )
+        )
+
+        if skew_std > 0:
+
+            skew_deviation = abs(
+                observed_skew
+                - skew_mean
+            ) / skew_std
+
+        else:
+
+            skew_deviation = abs(
+                observed_skew
+                - skew_mean
+            )
+
+        df.at[
+            index,
+            "clock_skew_deviation",
+        ] = skew_deviation
+
+
+        # -----------------------------------------------
         # RSSI deviation
-        rssi_center = (p['rssi_max'] + p['rssi_min']) / 2
-        rssi_range  = max(p['rssi_max'] - p['rssi_min'], 10)
-        df.at[idx, 'rssi_deviation'] = abs(
-            row['rssi'] - rssi_center
+        # -----------------------------------------------
+
+        rssi_min = float(
+            profile.get(
+                "rssi_min",
+                0.0,
+            )
+        )
+
+        rssi_max = float(
+            profile.get(
+                "rssi_max",
+                0.0,
+            )
+        )
+
+        rssi_center = (
+            rssi_max
+            + rssi_min
+        ) / 2
+
+        # Prevent extremely small baseline ranges from
+        # producing disproportionately large deviations.
+        rssi_range = max(
+            rssi_max
+            - rssi_min,
+            10.0,
+        )
+
+        df.at[
+            index,
+            "rssi_deviation",
+        ] = abs(
+            float(
+                row.get(
+                    "rssi",
+                    0.0,
+                )
+            )
+            - rssi_center
         ) / rssi_range
-        
-        # Hard fingerprint matches (1=match, 0=mismatch)
-        df.at[idx, 'ie_count_match']   = int(
-            row['ie_count'] == p['ie_count']
+
+
+        # -----------------------------------------------
+        # Structural / configuration comparisons
+        # -----------------------------------------------
+
+        df.at[
+            index,
+            "ie_count_match",
+        ] = int(
+            row.get(
+                "ie_count"
+            )
+            == profile.get(
+                "ie_count"
+            )
         )
-        df.at[idx, 'rate_count_match'] = int(
-            row['rate_count'] == p['rate_count']
+
+        df.at[
+            index,
+            "rate_count_match",
+        ] = int(
+            row.get(
+                "rate_count"
+            )
+            == profile.get(
+                "rate_count"
+            )
         )
-        df.at[idx, 'security_match']   = int(
-            row['security'] == p['security']
+
+        df.at[
+            index,
+            "security_match",
+        ] = int(
+            row.get(
+                "security"
+            )
+            == profile.get(
+                "security"
+            )
         )
-        df.at[idx, 'channel_match']    = int(
-            row['channel'] == p['channel']
+
+        df.at[
+            index,
+            "channel_match",
+        ] = int(
+            row.get(
+                "channel"
+            )
+            == profile.get(
+                "channel"
+            )
         )
-    
-    print("[✓] Advanced features engineered")
+
+
+    print(
+        "[✓] Profile-relative features engineered"
+    )
+
     return df
 
 
-def train_per_bssid_models(df, profiles):
+# =======================================================
+# PER-BSSID MODELS
+# =======================================================
+
+def train_per_bssid_models(
+    df,
+    profiles,
+):
     """
-    Train a separate Isolation Forest for each BSSID.
-    
-    WHY PER-BSSID?
-    Each AP has unique behavior patterns.
-    Training one model per AP means the model
-    learns exactly what THAT specific hardware
-    looks like. Any deviation = anomaly = Evil Twin.
-    
-    This is the most accurate approach because:
-    - LAB_AP_01 model only knows LAB_AP_01
-    - Any AP claiming to be LAB_AP_01 but
-      behaving differently = caught immediately
+    Train one Isolation Forest for each sufficiently
+    observed profiled BSSID.
+
+    A per-BSSID model learns the normal feature
+    distribution for one AP rather than forcing all
+    APs into a single behavioral baseline.
+
+    Returns
+    -------
+    tuple
+        models, scalers, feature_names
     """
-    print("\n[*] Training per-BSSID anomaly models...")
-    
-    per_bssid_models  = {}
+
+    print(
+        "\n[*] Training per-BSSID "
+        "Isolation Forest models..."
+    )
+
+    per_bssid_models = {}
     per_bssid_scalers = {}
-    
-    # Features for per-BSSID model
-    # Focus on timing and hardware fingerprints
-    bssid_features = [
-        'clock_skew',         # Hardware DNA
-        'rssi',               # Signal pattern
-        'seq_jump',           # Sequence behavior
-        'inter_beacon_ms',    # Timing pattern
+
+
+    candidate_features = [
+        "clock_skew",
+        "rssi",
+        "seq_jump",
+        "inter_beacon_ms",
     ]
-    
+
+
     available_features = [
-        f for f in bssid_features if f in df.columns
+        feature
+        for feature
+        in candidate_features
+        if feature in df.columns
     ]
-    
-    for bssid, profile in profiles.items():
-        bssid_data = df[df['bssid'] == bssid]
-        
-        if len(bssid_data) < 20:
-            continue
-        
-        X = bssid_data[available_features].values
-        
-        # Remove rows with NaN
-        mask = ~np.isnan(X).any(axis=1)
-        X    = X[mask]
-        
-        if len(X) < 10:
-            continue
-        
-        # Scale features
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-        
-        # Train Isolation Forest
-        # contamination=0.05 means we expect 5% anomalies
-        model = IsolationForest(
-            contamination = 0.05,
-            n_estimators  = 100,
-            random_state  = config.RANDOM_STATE
+
+
+    if not available_features:
+
+        raise ValueError(
+            "No per-BSSID training features "
+            "were found in the dataset."
         )
-        model.fit(X_scaled)
-        
-        per_bssid_models[bssid]  = model
-        per_bssid_scalers[bssid] = scaler
-        
-        ssid = profile['ssid']
-        print(f"  ✅ Trained model for: {ssid[:25]} "
-              f"({len(X)} samples)")
-    
-    return per_bssid_models, per_bssid_scalers, available_features
 
 
-def train_global_model(df):
+    for bssid, profile in profiles.items():
+
+        bssid_data = df[
+            df["bssid"] == bssid
+        ]
+
+
+        if len(bssid_data) < 20:
+
+            print(
+                "  [skip] "
+                f"{profile.get('ssid', bssid)}: "
+                "fewer than 20 observations"
+            )
+
+            continue
+
+
+        X = (
+            bssid_data[
+                available_features
+            ]
+            .replace(
+                [np.inf, -np.inf],
+                np.nan,
+            )
+            .dropna()
+            .values
+        )
+
+
+        if len(X) < 10:
+
+            print(
+                "  [skip] "
+                f"{profile.get('ssid', bssid)}: "
+                "fewer than 10 valid feature rows"
+            )
+
+            continue
+
+
+        scaler = StandardScaler()
+
+        X_scaled = scaler.fit_transform(
+            X
+        )
+
+
+        model = IsolationForest(
+            contamination=CONTAMINATION,
+            n_estimators=100,
+            random_state=config.RANDOM_STATE,
+        )
+
+        model.fit(
+            X_scaled
+        )
+
+
+        per_bssid_models[
+            bssid
+        ] = model
+
+        per_bssid_scalers[
+            bssid
+        ] = scaler
+
+
+        ssid = profile.get(
+            "ssid",
+            "<Unknown>",
+        )
+
+
+        print(
+            f"  [✓] {ssid[:25]:25} "
+            f"| {len(X):5d} observations"
+        )
+
+
+    print(
+        f"[✓] Trained "
+        f"{len(per_bssid_models)} "
+        "per-BSSID models"
+    )
+
+
+    return (
+        per_bssid_models,
+        per_bssid_scalers,
+        available_features,
+    )
+
+
+# =======================================================
+# GLOBAL EXPERIMENTAL MODEL
+# =======================================================
+
+def train_global_model(
+    df,
+):
     """
-    Train a global Random Forest model on all APs.
-    
-    This model learns patterns that distinguish
-    normal AP behavior from anomalous behavior
-    across ALL known APs.
-    
-    Works as a second layer of detection after
-    the per-BSSID models.
+    Train an experimental global Isolation Forest.
+
+    The global model uses both raw observations and
+    profile-relative features across all available APs.
+
+    The live detector currently emphasizes per-BSSID
+    models and rule / fingerprint evidence. This global
+    model is retained as a secondary experimental layer.
+
+    Returns
+    -------
+    tuple
+        model, scaler, feature_names
     """
-    print("\n[*] Training global anomaly detection model...")
-    
-    # Features for global model
-    global_features = [
-        'rssi',
-        'channel',
-        'seq_jump',
-        'seq_anomaly_score',
-        'clock_skew',
-        'beacon_interval',
-        'ie_count',
-        'capabilities',
-        'security_encoded',
-        'rate_count',
-        'clock_skew_deviation',
-        'rssi_deviation',
-        'ie_count_match',
-        'rate_count_match',
-        'security_match',
-        'channel_match'
+
+    print(
+        "\n[*] Training experimental "
+        "global Isolation Forest..."
+    )
+
+
+    candidate_features = [
+        "rssi",
+        "channel",
+        "seq_jump",
+        "seq_anomaly_score",
+        "clock_skew",
+        "beacon_interval",
+        "ie_count",
+        "capabilities",
+        "security_encoded",
+        "rate_count",
+        "clock_skew_deviation",
+        "rssi_deviation",
+        "ie_count_match",
+        "rate_count_match",
+        "security_match",
+        "channel_match",
     ]
-    
-    available = [f for f in global_features if f in df.columns]
-    X         = df[available].fillna(0).values
-    
-    # For global model, use Isolation Forest
-    # since we only have normal data
-    scaler    = StandardScaler()
-    X_scaled  = scaler.fit_transform(X)
-    
+
+
+    available_features = [
+        feature
+        for feature
+        in candidate_features
+        if feature in df.columns
+    ]
+
+
+    if not available_features:
+
+        raise ValueError(
+            "No global-model features "
+            "were found in the dataset."
+        )
+
+
+    clean_features = (
+        df[
+            available_features
+        ]
+        .replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+        .fillna(0)
+    )
+
+
+    X = clean_features.values
+
+
+    scaler = StandardScaler()
+
+    X_scaled = scaler.fit_transform(
+        X
+    )
+
+
     model = IsolationForest(
-        contamination = 0.05,
-        n_estimators  = 200,
-        random_state  = config.RANDOM_STATE
+        contamination=CONTAMINATION,
+        n_estimators=200,
+        random_state=config.RANDOM_STATE,
     )
-    model.fit(X_scaled)
-    
-    # Calculate anomaly scores on training data
-    scores = model.decision_function(X_scaled)
-    print(f"  [✓] Global model trained on {len(X)} samples")
-    print(f"  [✓] Anomaly score range: "
-          f"{scores.min():.4f} to {scores.max():.4f}")
-    print(f"  [✓] Features used: {len(available)}")
-    
-    return model, scaler, available
 
 
-def save_all_models(per_bssid_models, per_bssid_scalers,
-                    bssid_features, global_model,
-                    global_scaler, global_features):
-    """Save all trained models to disk."""
-    
-    os.makedirs(config.MODELS_DIR, exist_ok=True)
-    
-    # Save per-BSSID models
+    model.fit(
+        X_scaled
+    )
+
+
+    scores = model.decision_function(
+        X_scaled
+    )
+
+
+    print(
+        f"  [✓] Global model trained on "
+        f"{len(X):,} observations"
+    )
+
+    print(
+        "  [✓] Training decision-score range: "
+        f"{scores.min():.4f} to "
+        f"{scores.max():.4f}"
+    )
+
+    print(
+        f"  [✓] Features used: "
+        f"{len(available_features)}"
+    )
+
+
+    return (
+        model,
+        scaler,
+        available_features,
+    )
+
+
+# =======================================================
+# MODEL SERIALIZATION
+# =======================================================
+
+def save_all_models(
+    per_bssid_models,
+    per_bssid_scalers,
+    bssid_features,
+    global_model,
+    global_scaler,
+    global_features,
+):
+    """
+    Save trained anomaly models and metadata.
+    """
+
+    os.makedirs(
+        config.MODELS_DIR,
+        exist_ok=True,
+    )
+
+
     per_bssid_path = os.path.join(
-        config.MODELS_DIR, 'per_bssid_models.pkl'
+        config.MODELS_DIR,
+        "per_bssid_models.pkl",
     )
-    joblib.dump({
-        'models':   per_bssid_models,
-        'scalers':  per_bssid_scalers,
-        'features': bssid_features
-    }, per_bssid_path)
-    
-    # Save global model
-    global_path = os.path.join(
-        config.MODELS_DIR, 'global_model.pkl'
-    )
-    joblib.dump({
-        'model':    global_model,
-        'scaler':   global_scaler,
-        'features': global_features
-    }, global_path)
-    
-    print(f"\n[✓] Per-BSSID models: {per_bssid_path}")
-    print(f"[✓] Global model    : {global_path}")
 
+
+    joblib.dump(
+        {
+            "models":
+                per_bssid_models,
+
+            "scalers":
+                per_bssid_scalers,
+
+            "features":
+                bssid_features,
+
+            "model_type":
+                "IsolationForest",
+
+            "contamination":
+                CONTAMINATION,
+        },
+        per_bssid_path,
+    )
+
+
+    global_path = os.path.join(
+        config.MODELS_DIR,
+        "global_model.pkl",
+    )
+
+
+    joblib.dump(
+        {
+            "model":
+                global_model,
+
+            "scaler":
+                global_scaler,
+
+            "features":
+                global_features,
+
+            "model_type":
+                "IsolationForest",
+
+            "contamination":
+                CONTAMINATION,
+
+            "status":
+                "experimental_secondary_model",
+        },
+        global_path,
+    )
+
+
+    print(
+        "\n[✓] Per-BSSID model bundle: "
+        f"{per_bssid_path}"
+    )
+
+    print(
+        "[✓] Global model bundle    : "
+        f"{global_path}"
+    )
+
+
+# =======================================================
+# MAIN
+# =======================================================
 
 def main():
-    print("\n" + "="*65)
-    print("  ADVANCED AI MODEL BUILDER")
-    print("="*65)
-    
-    # Step 1: Load data
-    df = load_and_prepare_data()
-    
-    # Step 2: Load profiles
-    if not os.path.exists(config.BSSID_PROFILES_FILE):
-        print("[ERROR] BSSID profiles not found!")
-        print("[ERROR] Run build_profiles.py first")
-        sys.exit(1)
-    
-    with open(config.BSSID_PROFILES_FILE, 'r') as f:
-        profiles = json.load(f)
-    print(f"[✓] Loaded {len(profiles)} BSSID profiles")
-    
-    # Step 3: Engineer features
-    df = engineer_features(df)
-    
-    # Step 4: Train per-BSSID models
-    per_bssid_models, per_bssid_scalers, bssid_features = \
-        train_per_bssid_models(df, profiles)
-    
-    # Step 5: Train global model
-    global_model, global_scaler, global_features = \
-        train_global_model(df)
-    
-    # Step 6: Save everything
-    save_all_models(
-        per_bssid_models, per_bssid_scalers, bssid_features,
-        global_model, global_scaler, global_features
+    """
+    Build all behavioral anomaly models.
+    """
+
+    print(
+        "\n"
+        + "=" * 68
     )
-    
-    print("\n" + "="*65)
-    print("  TRAINING COMPLETE")
-    print("="*65)
-    print(f"  Per-BSSID models : {len(per_bssid_models)}")
-    print(f"  Global model     : 1")
-    print(f"  BSSID features   : {bssid_features}")
-    print(f"  Global features  : {len(global_features)}")
-    print()
-    print("  Detection capability:")
-    print("  ✅ Detects BSSID mismatch (basic)")
-    print("  ✅ Detects IE count mismatch (hardware)")
-    print("  ✅ Detects clock skew deviation (unfakeable)")
-    print("  ✅ Detects timing anomalies (unfakeable)")
-    print("  ✅ Detects duplicate sequences (unfakeable)")
-    print("  ✅ Works against PERFECT Evil Twins")
-    print("="*65)
-    print("\n  Next step: Run main.py and choose option 3")
+
+    print(
+        "  BEHAVIORAL ANOMALY MODEL BUILDER"
+    )
+
+    print(
+        "=" * 68
+    )
+
+    print(
+        "  Model type : Isolation Forest"
+    )
+
+    print(
+        "  Training   : Legitimate baseline observations"
+    )
+
+    print(
+        "  Strategy   : Per-BSSID + experimental global model"
+    )
+
+    print(
+        "=" * 68
+    )
+
+
+    try:
+
+        # Step 1
+        df = load_and_prepare_data()
+
+
+        # Step 2
+        profiles = load_profiles()
+
+
+        # Step 3
+        df = engineer_features(
+            df,
+            profiles,
+        )
+
+
+        # Step 4
+        (
+            per_bssid_models,
+            per_bssid_scalers,
+            bssid_features,
+        ) = train_per_bssid_models(
+            df,
+            profiles,
+        )
+
+
+        # Step 5
+        (
+            global_model,
+            global_scaler,
+            global_features,
+        ) = train_global_model(
+            df
+        )
+
+
+        # Step 6
+        save_all_models(
+            per_bssid_models,
+            per_bssid_scalers,
+            bssid_features,
+            global_model,
+            global_scaler,
+            global_features,
+        )
+
+
+    except Exception as error:
+
+        print(
+            "\n[ERROR] Model build failed:"
+        )
+
+        print(
+            f"        {error}"
+        )
+
+        sys.exit(
+            1
+        )
+
+
+    print(
+        "\n"
+        + "=" * 68
+    )
+
+    print(
+        "  MODEL BUILD COMPLETE"
+    )
+
+    print(
+        "=" * 68
+    )
+
+    print(
+        f"  Per-BSSID models : "
+        f"{len(per_bssid_models)}"
+    )
+
+    print(
+        "  Global models    : 1 experimental model"
+    )
+
+    print(
+        "  Per-BSSID features:"
+    )
+
+    for feature in bssid_features:
+
+        print(
+            f"    - {feature}"
+        )
+
+
+    print(
+        "  Global features  : "
+        f"{len(global_features)}"
+    )
+
+
+    print(
+        "\n  Detection support provided by these models:"
+    )
+
+    print(
+        "  • Per-AP behavioral anomaly scoring"
+    )
+
+    print(
+        "  • Timing and sequence-pattern deviation analysis"
+    )
+
+    print(
+        "  • RSSI deviation as contextual evidence"
+    )
+
+    print(
+        "  • Profile-relative structural deviations"
+    )
+
+
+    print(
+        "\n  Important:"
+    )
+
+    print(
+        "  These models identify statistical anomalies."
+    )
+
+    print(
+        "  They do not independently confirm an Evil Twin."
+    )
+
+    print(
+        "=" * 68
+    )
+
+    print(
+        "\nNext step:"
+    )
+
+    print(
+        "Run main.py and select the live detector."
+    )
 
 
 if __name__ == "__main__":
