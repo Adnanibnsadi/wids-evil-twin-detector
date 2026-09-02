@@ -448,6 +448,68 @@ live detection pipeline.
 
 ---
 
+# 🧪 Testing
+
+The repository includes hardware-independent unit tests for the main WIDS components.
+
+Current automated coverage includes:
+
+- Synthetic 802.11 beacon construction
+- SSID and channel parsing
+- Basic security classification
+- Scanner state handling
+- BSSID / SSID inconsistency detection
+- Duplicate sequence activity
+- Information Element deviations
+- Security changes
+- Timing-based evidence
+- Per-BSSID anomaly-model evidence
+- Threat-score aggregation and threshold behavior
+
+The test suite does not require:
+
+- Root privileges
+- Monitor mode
+- A wireless adapter
+- Live packet capture
+- Packet transmission
+
+## Run Tests Locally
+
+Install the development dependencies:
+
+```bash
+python -m pip install -r requirements-dev.txt
+```
+
+Check Python syntax:
+
+```bash
+python -m compileall -q main.py config.py modules scripts tests
+```
+
+Run the full test suite:
+
+```bash
+python -m pytest -v
+```
+
+The current suite contains **32 tests**.
+
+## Continuous Integration
+
+GitHub Actions automatically runs the syntax checks and pytest suite on:
+
+- Pushes to `main`
+- Pull requests
+- Manual workflow runs
+
+The CI workflow currently runs on Python 3.12.
+
+The hardware-independent test suite has also been verified locally on Kali Linux with Python 3.14.
+
+---
+
 # 🧪 Advanced Multi-AP Workflow
 
 The newer research workflow supports collecting legitimate traffic from multiple nearby APs and building individual behavioral profiles.
