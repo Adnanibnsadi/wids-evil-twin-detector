@@ -99,7 +99,7 @@ Different detection layers provide different types of evidence.
 | Same SSID with unexpected BSSID | Strong evidence | Detects conventional Evil Twin / rogue AP scenarios |
 | Information Element deviation | Strong evidence | Detects changes in beacon structure |
 | Security configuration change | Strong evidence | Detects differences in advertised security |
-| Supported-rate deviation | Supporting evidence | Helps identify implementation or hardware differences |
+| Supported-rate deviation | Supporting evidence | Helps identify implementation or configuration differences |
 | Clock-skew / timing anomaly | Supporting evidence | Looks for unusual transmitter timing behavior |
 | Per-BSSID Isolation Forest | Supporting ML evidence | Detects abnormal behavior relative to the AP's learned baseline |
 
@@ -321,10 +321,8 @@ wids-evil-twin-detector/
 │   └── .gitkeep
 │
 └── visualizations/
-    ├── 1_clock_skew_fingerprints.png
-    ├── 2_ie_hardware_fingerprints.png
-    ├── 3_sequence_collision_proof.png
-    └── 4_ai_layer_weights.png
+  
+    └── README.md
 ```
 
 Real captures, generated profiles, logs, and trained models are intentionally excluded from the public repository where they may contain environment-specific or identifying information.
@@ -433,15 +431,19 @@ The CLI provides options for:
 
 ```text
 [1] Scan nearby networks
-[2] Learn network behavior
-[3] Start Evil Twin detection
-[4] Run the lab Evil Twin simulator
-[5] Train the baseline model
-[6] Full auto mode
+[2] Collect multi-AP benign baseline
+[3] Build profiles and anomaly models
+[4] Start live WIDS detection
+[5] Run authorised Evil Twin lab simulator
+[6] Check project resource status
 [0] Exit
 ```
 
-> Attack simulation must only be used in a controlled environment on networks and hardware you own or are explicitly authorized to test.
+>The main CLI now follows the current multi-AP research workflow. The older
+single-AP profiling and supervised Random Forest components remain in the
+repository as legacy experimental baselines but are not part of the primary
+live detection pipeline.
+>  Attack simulation must only be used in a controlled environment on networks and hardware you own or are explicitly authorized to test.
 
 ---
 
