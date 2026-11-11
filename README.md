@@ -85,52 +85,57 @@ These indicators contribute to a combined suspicion score. The detector also req
 The current weights and thresholds were selected during prototype development. They are not statistically calibrated attack probabilities.
 
 This approach helps investigate suspicious wireless activity, but an alert alone cannot confirm that an Evil Twin attack has occurred. Broader testing is still needed to understand false alerts and detection reliability.
-## Features Extracted from Beacons
+## Features Extracted from Beacon Frames
 
-The system extracts features such as:
+The detector uses information from IEEE 802.11 beacon frames to study the behavior of nearby access points.
 
-- SSID
-- BSSID
-- RSSI
-- Channel
-- Sequence number
-- Sequence jump
-- Beacon timestamp / TSF
-- Clock-skew estimate
-- Beacon interval
-- Capabilities
-- Security type
-- Information Element count
-- Supported-rate count
-- Inter-beacon timing
-- Duplicate-sequence indicators
+Some features are extracted directly from captured frames, while others are calculated by comparing observations collected over time.
 
----
+### Beacon Information
+
+| Feature | Purpose |
+|---|---|
+| SSID | Identifies the advertised wireless network name. |
+| BSSID | Identifies the access point's advertised MAC address. |
+| RSSI | Records received signal strength as contextual information. |
+| Channel | Identifies the advertised wireless channel. |
+| Sequence number | Helps examine changes and inconsistencies in frame sequence behavior. |
+| Beacon timestamp (TSF) | Provides timing information advertised by the transmitter. |
+| Beacon interval | Describes the advertised interval between beacon transmissions. |
+| Security configuration | Supports comparisons with known access-point characteristics. |
+| Information Element count | Provides a basic measure of beacon structure. |
+| Supported-rate count | Helps identify differences in advertised capabilities. |
+
+### Derived Features
+
+The detector also calculates behavioral indicators from successive observations:
+
+- **Sequence jumps:** Changes between observed sequence numbers.
+- **Duplicate-sequence indicators:** Potentially conflicting sequence observations associated with the same BSSID.
+- **Inter-beacon timing:** Elapsed time between captured beacon observations.
+- **Clock-skew estimates:** Timing-related deviations calculated from beacon observations.
+
+These measurements have limitations. For example, missing frames and channel hopping can affect sequence and timing calculations, while RSSI can change because of movement or environmental conditions.
+
+For this reason, individual feature deviations are treated as evidence for further analysis rather than automatic proof of an attack.
+
+
 
 ## Per-Access-Point Profiling
 
-Instead of assuming that all routers behave identically, the system builds profiles for individual BSSIDs.
+Different access points can have different beacon characteristics, even when they belong to the same wireless network.
 
-A profile may contain:
+Instead of comparing every captured frame against one general baseline, the project builds behavioral profiles for individual BSSIDs.
 
-- Expected IE count
-- Expected supported-rate count
-- Security configuration
-- Channel
-- Beacon interval
-- Clock-skew statistics
-- RSSI statistics
-- Sequence-jump statistics
-- Number of observed beacons
+The profiling workflow collects observations from known access points and summarizes their expected characteristics, including beacon structure, security configuration, sequence behavior, and timing measurements.
 
-This allows the detector to ask:
+These profiles provide a reference for evaluating new observations.
 
-> **Is this behaviour unusual for this specific access point?**
+For example, if an access point normally advertises a particular security configuration and beacon structure, unexpected changes may contribute to the detector's suspicion score.
 
-rather than simply asking whether the frame looks unusual compared with every AP in the environment.
+The goal is to identify behavior that differs from an access point's observed baseline, rather than assuming that every unusual frame represents an Evil Twin attack.
 
----
-
+**Current limitation:** A BSSID is an advertised identifier, not proof of a device's physical identity. Profiles can also be affected by noisy measurements, limited observation periods, or changes in legitimate access-point configuration.
 ## Machine Learning Layer
 
 The current advanced detector uses **Isolation Forest** models trained separately for sufficiently observed BSSIDs.
