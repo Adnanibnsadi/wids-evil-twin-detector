@@ -136,28 +136,59 @@ For example, if an access point normally advertises a particular security config
 The goal is to identify behavior that differs from an access point's observed baseline, rather than assuming that every unusual frame represents an Evil Twin attack.
 
 **Current limitation:** A BSSID is an advertised identifier, not proof of a device's physical identity. Profiles can also be affected by noisy measurements, limited observation periods, or changes in legitimate access-point configuration.
+
 ## Machine Learning Layer
 
-The current advanced detector uses **Isolation Forest** models trained separately for sufficiently observed BSSIDs.
+I use Isolation Forest as an additional detection method alongside the rule-based checks.
 
-Current ML features include:
+The idea is to learn the normal behavior of a known access point and identify observations that differ from that baseline.
 
-```python
-[
-    "clock_skew",
-    "rssi",
-    "seq_jump",
-    "inter_beacon_ms"
-]
-```
+### Model Training
 
-Each AP receives its own scaler and anomaly model.
+The current workflow uses observations collected from known access points during baseline monitoring.
 
-The ML layer is deliberately treated as **supporting evidence** because RF and timing measurements can be noisy in real environments.
+For BSSIDs with sufficient observations, the system trains a separate Isolation Forest model and stores its associated feature scaler.
 
-A secondary global Isolation Forest model is also available for engineered deviation features.
+The model uses four behavioral features:
 
----
+| Feature | Description |
+|---|---|
+| `clock_skew` | Estimated timing deviation derived from beacon observations. |
+| `rssi` | Received signal strength of the observed beacon. |
+| `seq_jump` | Difference between successive observed sequence numbers. |
+| `inter_beacon_ms` | Time between successive captured beacon observations, in milliseconds. |
+
+Training models separately allows the detector to compare an access point's behavior against its own collected baseline rather than treating every AP as identical.
+
+### Anomaly Detection
+
+During monitoring, the system can evaluate new observations using the corresponding BSSID's trained model.
+
+Isolation Forest identifies patterns that differ from the training data. An anomalous prediction may contribute to the detector's combined suspicion score.
+
+The model does not directly identify an Evil Twin attacker. It detects unusual behavior that may have several possible explanations.
+
+### Secondary Model
+
+The research workflow also includes a separate global Isolation Forest model trained on engineered deviation features.
+
+The per-BSSID models remain the primary focus of the current ML-assisted detection approach.
+
+### Current Limitations
+
+The machine-learning component is experimental.
+
+In particular:
+
+- RSSI can change because of movement, distance, or interference.
+- Timing measurements can be affected by packet loss, channel hopping, and virtualization.
+- A limited training dataset may not represent normal behavior across different environments.
+- An anomaly score is not the probability that an attack has occurred.
+- The current prototype has not undergone sufficiently broad independent testing to establish reliable detection and false-positive rates.
+
+My next goal is to evaluate the models using separate capture sessions and compare the results with the rule-based detector.
+
+This should help determine whether machine learning provides a measurable improvement rather than assuming that adding it automatically makes detection more accurate.
 
 ## Timing & VMware Considerations
 
