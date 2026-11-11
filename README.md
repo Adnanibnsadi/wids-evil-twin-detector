@@ -58,24 +58,33 @@ When the configured conditions are met, it generates an alert for further invest
 
 ## Why a Hybrid Detector?
 
-The machine-learning model is **one component** of the detector rather than the sole decision maker.
+I chose a hybrid approach because relying on a single characteristic of Wi-Fi beacon traffic can produce misleading results.
 
-Different detection layers provide different types of evidence.
+For example, two legitimate access points may share the same SSID, while changes in signal strength or beacon timing can occur without an attack.
 
-| Detection Layer | Type | Purpose |
-|---|---|---|
-| Duplicate / conflicting sequence behavior | Strong evidence | Detects suspicious sequence activity associated with the same BSSID |
-| Same SSID with unexpected BSSID | Strong evidence | Detects conventional Evil Twin / rogue AP scenarios |
-| Information Element deviation | Strong evidence | Detects changes in beacon structure |
-| Security configuration change | Strong evidence | Detects differences in advertised security |
-| Supported-rate deviation | Supporting evidence | Helps identify implementation or configuration differences |
-| Clock-skew / timing anomaly | Supporting evidence | Looks for unusual transmitter timing behavior |
-| Per-BSSID Isolation Forest | Supporting ML evidence | Detects abnormal behaviour relative to the AP's learned baseline |
+The detector therefore uses several indicators rather than relying entirely on one rule or machine-learning prediction.
 
-The detector combines these characteristics because reproducing several independent behavioural and structural properties consistently can be more difficult than simply copying an SSID or BSSID.
+### Detection Methods
 
----
+| Detection method | What it checks |
+|---|---|
+| Sequence-number analysis | Looks for unexpected sequence behavior, including duplicate or conflicting observations associated with a BSSID. |
+| SSID and BSSID comparison | Identifies access points that differ from previously recorded network profiles. |
+| Information Element comparison | Checks for differences in beacon structure, currently using basic characteristics such as IE counts. |
+| Security configuration | Compares advertised security characteristics with the known AP profile. |
+| Supported-rate comparison | Looks for differences in supported-rate counts. |
+| Timing analysis | Examines unusual beacon timing and clock-skew estimates, while accounting for measurement noise. |
+| Isolation Forest | Identifies observations that differ from the behavioral baseline learned for an individual BSSID. |
 
+### How the Results Are Combined
+
+The rule-based checks provide interpretable indicators, while Isolation Forest adds another way to identify unusual behavior that may not be captured by fixed rules.
+
+These indicators contribute to a combined suspicion score. The detector also requires consecutive suspicious observations before generating an alert.
+
+The current weights and thresholds were selected during prototype development. They are not statistically calibrated attack probabilities.
+
+This approach helps investigate suspicious wireless activity, but an alert alone cannot confirm that an Evil Twin attack has occurred. Broader testing is still needed to understand false alerts and detection reliability.
 ## Features Extracted from Beacons
 
 The system extracts features such as:
