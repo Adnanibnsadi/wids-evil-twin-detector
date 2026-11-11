@@ -1,40 +1,24 @@
-# 🛡️ Hybrid WIDS: Evil Twin & Rogue Access Point Detector
+# Wireless Intrusion Detection System (WIDS)
 
-> **Version 0.8 — Research Prototype / Working Lab System**
-> [![Tests](https://github.com/Adnanibnsadi/wids-evil-twin-detector/actions/workflows/tests.yml/badge.svg)](https://github.com/Adnanibnsadi/wids-evil-twin-detector/actions/workflows/tests.yml)
+**Version:** 0.8 | **Status:** Research Prototype
 
-A passive wireless intrusion detection system for Linux that profiles nearby IEEE 802.11 access points and detects suspicious or BSSID-spoofed access points using a combination of:
+This project explores how Wi-Fi beacon characteristics can be used to detect Evil Twin and BSSID-spoofing attacks.
 
-- 802.11 beacon fingerprinting
-- Sequence-number behavior
-- Information Element (IE) analysis
-- Security configuration checks
-- Timing / clock-skew analysis
-- Per-BSSID Isolation Forest anomaly detection
+I developed a Python-based wireless intrusion detection prototype that uses Scapy to capture IEEE 802.11 beacon frames and compare them against previously collected access-point profiles.
 
-The project is designed as a **hybrid detection system** rather than a purely machine-learning classifier. Deterministic wireless evidence and behavioral anomaly detection are combined to produce more explainable alerts.
+The detector combines sequence-number analysis, basic beacon Information Element comparisons, security-configuration checks, timing measurements, and per-BSSID Isolation Forest models to identify suspicious activity.
 
----
+## Why I started this project
 
-## 🎯 Project Objective
+An Evil Twin access point can imitate the SSID of a legitimate wireless network. More advanced attacks can also copy its BSSID, making identification based on network names and MAC addresses less reliable.
 
-Traditional Evil Twin detection often relies heavily on SSID and MAC/BSSID comparison.
+I wanted to investigate whether other characteristics of beacon traffic could help distinguish between legitimate access points and devices impersonating them.
 
-However, an attacker can advertise:
+During development, I encountered challenges with timing measurements, particularly when collecting traffic through a USB Wi-Fi adapter in Kali Linux running inside VMware.
 
-- the same SSID,
-- a similar security configuration,
-- and even the same BSSID as a legitimate access point.
+The project is still experimental. My current focus is improving detection reliability, reducing false alerts, and evaluating the system under more varied network conditions.
 
-This project explores a harder question:
-
-> **Can passive 802.11 beacon characteristics help distinguish a legitimate access point from another transmitter claiming the same logical identity?**
-
-The detector therefore builds behavioral profiles for legitimate APs and compares live beacon traffic against those profiles.
-
----
-
-## 🔬 Detection Architecture
+## Detection Architecture
 
 ```text
               Nearby IEEE 802.11 Beacon Frames
@@ -88,7 +72,7 @@ The detector therefore builds behavioral profiles for legitimate APs and compare
 
 ---
 
-## 🧠 Why a Hybrid Detector?
+## Why a Hybrid Detector?
 
 The machine-learning model is **one component** of the detector rather than the sole decision maker.
 
@@ -102,13 +86,13 @@ Different detection layers provide different types of evidence.
 | Security configuration change | Strong evidence | Detects differences in advertised security |
 | Supported-rate deviation | Supporting evidence | Helps identify implementation or configuration differences |
 | Clock-skew / timing anomaly | Supporting evidence | Looks for unusual transmitter timing behavior |
-| Per-BSSID Isolation Forest | Supporting ML evidence | Detects abnormal behavior relative to the AP's learned baseline |
+| Per-BSSID Isolation Forest | Supporting ML evidence | Detects abnormal behaviour relative to the AP's learned baseline |
 
-The detector combines these characteristics because reproducing several independent behavioral and structural properties consistently can be more difficult than simply copying an SSID or BSSID.
+The detector combines these characteristics because reproducing several independent behavioural and structural properties consistently can be more difficult than simply copying an SSID or BSSID.
 
 ---
 
-## 🔎 Features Extracted from Beacons
+## Features Extracted from Beacons
 
 The system extracts features such as:
 
@@ -130,7 +114,7 @@ The system extracts features such as:
 
 ---
 
-## 📡 Per-Access-Point Profiling
+## Per-Access-Point Profiling
 
 Instead of assuming that all routers behave identically, the system builds profiles for individual BSSIDs.
 
@@ -148,13 +132,13 @@ A profile may contain:
 
 This allows the detector to ask:
 
-> **Is this behavior unusual for this specific access point?**
+> **Is this behaviour unusual for this specific access point?**
 
 rather than simply asking whether the frame looks unusual compared with every AP in the environment.
 
 ---
 
-## 🤖 Machine Learning Layer
+## Machine Learning Layer
 
 The current advanced detector uses **Isolation Forest** models trained separately for sufficiently observed BSSIDs.
 
@@ -177,7 +161,7 @@ A secondary global Isolation Forest model is also available for engineered devia
 
 ---
 
-## ⚠️ Timing & VMware Considerations
+## Timing & VMware Considerations
 
 Development and testing were performed primarily using:
 
@@ -196,7 +180,7 @@ This timing filter significantly improved benign monitoring stability in the dev
 
 ---
 
-## 🚨 Alert Logic
+## Alert Logic
 
 The detector does not alert on every isolated anomaly.
 
@@ -213,7 +197,7 @@ The current implementation requires multiple consecutive suspicious observations
 
 ---
 
-## 📊 Demonstrated Lab Results
+## Demonstrated Lab Results
 
 The following results were obtained during controlled development experiments.
 
@@ -259,7 +243,7 @@ The experiment demonstrates detection of a **BSSID-spoofed laboratory transmitte
 
 ---
 
-## 📈 Visualizations
+## Visualizations
 
 The project includes a chart-generation script for analyzing locally collected wireless data.
 
@@ -285,7 +269,7 @@ Future releases will include sanitized or synthetic example visualizations that 
 
 ---
 
-## 📁 Repository Structure
+## Repository Structure
 
 ```text
 wids-evil-twin-detector/
@@ -330,7 +314,7 @@ Real captures, generated profiles, logs, and trained models are intentionally ex
 
 ---
 
-# 🚀 Installation
+# Installation
 
 ## Requirements
 
@@ -448,7 +432,7 @@ live detection pipeline.
 
 ---
 
-# 🧪 Testing
+# Testing
 
 The repository includes hardware-independent unit tests for the main WIDS components.
 
@@ -464,7 +448,7 @@ Current automated coverage includes:
 - Security changes
 - Timing-based evidence
 - Per-BSSID anomaly-model evidence
-- Threat-score aggregation and threshold behavior
+- Threat-score aggregation and threshold behaviour
 
 The test suite does not require:
 
@@ -510,9 +494,9 @@ The hardware-independent test suite has also been verified locally on Kali Linux
 
 ---
 
-# 🧪 Advanced Multi-AP Workflow
+# Advanced Multi-AP Workflow
 
-The newer research workflow supports collecting legitimate traffic from multiple nearby APs and building individual behavioral profiles.
+The newer research workflow supports collecting legitimate traffic from multiple nearby APs and building individual behavioural profiles.
 
 ## Collect Baseline Traffic
 
@@ -530,7 +514,7 @@ This generates a local multi-AP dataset.
 sudo ./venv/bin/python3 scripts/build_profiles.py
 ```
 
-This creates behavioral profiles for APs with sufficient observations.
+This creates behavioural profiles for APs with sufficient observations.
 
 ---
 
@@ -546,7 +530,7 @@ Generated datasets, profiles, and model files are intentionally excluded from th
 
 ---
 
-# 🧩 Current Research Questions
+# Current Research Questions
 
 This prototype is being developed around two main questions:
 
@@ -554,11 +538,11 @@ This prototype is being developed around two main questions:
 
 and
 
-> **Which combination of sequence behavior, beacon structure, timing characteristics, and anomaly detection provides useful attack detection while maintaining a low false-alert rate?**
+> **Which combination of sequence behaviour, beacon structure, timing characteristics, and anomaly detection provides useful attack detection while maintaining a low false-alert rate?**
 
 ---
 
-# ⚠️ Current Limitations
+# Current Limitations
 
 Version 0.8 is a research prototype and has several important limitations.
 
@@ -566,7 +550,7 @@ Version 0.8 is a research prototype and has several important limitations.
 
 Current experiments were conducted in a limited number of environments.
 
-A larger evaluation should contain:
+A larger evaluation should include:
 
 - Multiple locations
 - Multiple capture sessions
@@ -580,7 +564,7 @@ A larger evaluation should contain:
 
 Thousands of beacon frames do not necessarily represent thousands of statistically independent observations.
 
-Future ML evaluation will therefore separate training and testing by **capture session** rather than randomly splitting neighboring beacon rows.
+Future ML evaluation will therefore separate training and testing by **capture session** rather than randomly splitting neighbouring beacon rows.
 
 ---
 
@@ -625,13 +609,13 @@ For this reason, results are described as **BSSID-spoofed Evil Twin detection**,
 
 Current detection weights and thresholds were empirically selected during prototype calibration.
 
-They are **threat / suspicion scores**, not statistically calibrated attack probabilities.
+They are **threat/suspicion scores**, not statistically calibrated attack probabilities.
 
 Future versions will evaluate and tune these parameters using independent validation sessions.
 
 ---
 
-# 🗺️ Roadmap to v1.0
+# Roadmap to v1.0
 
 Planned improvements include:
 
@@ -658,7 +642,7 @@ Planned improvements include:
 
 ---
 
-# 🧪 Planned Evaluation Strategy
+# Planned Evaluation Strategy
 
 Future evaluation will test progressively more challenging attacker configurations.
 
@@ -681,7 +665,7 @@ Level 5
 Same BSSID with higher-fidelity IE structure
 
 Level 6
-Improved sequence behavior
+Improved sequence behaviour
 
 Level 7
 Higher-fidelity beacon reproduction
@@ -691,7 +675,7 @@ The objective is to determine which detection layers remain useful as attacker f
 
 ---
 
-# 🔬 Planned Ablation Study
+# Planned Ablation Study
 
 The hybrid architecture will also be evaluated by removing individual detection components.
 
@@ -717,7 +701,7 @@ This will help measure the contribution of each component rather than assuming t
 
 ---
 
-# 🔒 Privacy & Public Dataset Policy
+# Privacy & Public Dataset Policy
 
 Wireless captures can contain real:
 
@@ -726,7 +710,7 @@ Wireless captures can contain real:
 - Network characteristics
 - Environmental information
 
-For privacy reasons, real neighborhood captures and generated profiles are not included in the public repository.
+For privacy reasons, real neighbourhood captures and generated profiles are not included in the public repository.
 
 Public examples should use synthetic or anonymized identifiers such as:
 
@@ -739,7 +723,7 @@ Future releases are planned to include synthetic datasets that allow detector lo
 
 ---
 
-# ⚖️ Ethical Use
+# Ethical Use
 
 This project is intended for:
 
@@ -754,7 +738,7 @@ Do not use the simulation or packet-injection functionality against networks or 
 
 ---
 
-# 📌 Project Status
+# Project Status
 
 **Current Version:** `v0.8`
 
@@ -775,7 +759,7 @@ The next development phase focuses on **stronger experimental validation, higher
 
 ---
 
-# 📜 License
+# License
 
 This project is released under the **MIT License**.
 
@@ -783,7 +767,7 @@ See [`LICENSE`](LICENSE) for details.
 
 ---
 
-# 👤 Author
+# Author
 
 **Adnan Sadi**
 
@@ -803,4 +787,4 @@ GitHub: [@Adnanibnsadi](https://github.com/Adnanibnsadi)
 
 ---
 
-> ⭐ This repository documents an ongoing undergraduate cybersecurity research and engineering project. Feedback, technical discussion, and research suggestions are welcome.
+> This repository documents an ongoing undergraduate cybersecurity research and engineering project. Feedback, technical discussion, and research suggestions are welcome.
