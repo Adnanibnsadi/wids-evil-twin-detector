@@ -20,57 +20,41 @@ The project is still experimental. My current focus is improving detection relia
 
 ## Detection Architecture
 
-```text
-              Nearby IEEE 802.11 Beacon Frames
-                           │
-                           ▼
-                  ┌──────────────────┐
-                  │  Beacon Capture  │
-                  │      Scapy       │
-                  └────────┬─────────┘
-                           │
-                           ▼
-                ┌──────────────────────┐
-                │   Feature Extraction │
-                │                      │
-                │ SSID / BSSID         │
-                │ RSSI / Channel       │
-                │ Sequence Number      │
-                │ Beacon Timestamp     │
-                │ Security             │
-                │ IE Count             │
-                │ Rate Count           │
-                │ Timing Features      │
-                └──────────┬───────────┘
-                           │
-                           ▼
-               ┌────────────────────────┐
-               │ Known AP Profile       │
-               │ Comparison             │
-               └───────────┬────────────┘
-                           │
-          ┌────────────────┼────────────────┐
-          │                │                │
-          ▼                ▼                ▼
-  Sequence Analysis   IE / Security    Timing Analysis
-          │            Fingerprints          │
-          └────────────────┬────────────────┘
-                           │
-                           ▼
-                 Per-BSSID Isolation
-                     Forest Model
-                           │
-                           ▼
-                    Evidence Scoring
-                           │
-                           ▼
-              Consecutive Suspicion Check
-                           │
-                           ▼
-                         ALERT
-```
+The detector follows a five-stage workflow, from capturing Wi-Fi beacon frames to generating security alerts.
 
----
+### 1. Beacon Capture
+
+Scapy captures IEEE 802.11 beacon frames using a compatible Wi-Fi adapter in monitor mode.
+
+### 2. Feature Extraction
+
+The system extracts information such as SSID, BSSID, channel, signal strength (RSSI), sequence numbers, beacon timestamps, security configuration, and Information Element counts.
+
+### 3. Access Point Profiling
+
+Captured observations are compared against previously collected profiles of known access points. Each profile represents the expected characteristics of a particular BSSID.
+
+### 4. Suspicious Behavior Detection
+
+The detector combines multiple checks:
+
+- Sequence-number inconsistencies
+- Unexpected BSSID or security-configuration changes
+- Beacon Information Element deviations
+- Timing anomalies
+- Per-BSSID Isolation Forest anomaly scores, where a trained model is available
+
+These checks provide different types of evidence. An unusual observation alone does not necessarily indicate an attack.
+
+### 5. Evidence Scoring and Alerts
+
+The system combines suspicious indicators into a threat score.
+
+To reduce alerts caused by isolated or noisy observations, the detector uses a consecutive-suspicion threshold and per-BSSID alert cooldowns.
+
+When the configured conditions are met, it generates an alert for further investigation.
+
+**Note:** The system is a research prototype. Its alerts indicate potentially suspicious wireless behavior, not confirmed attacker identity.
 
 ## Why a Hybrid Detector?
 
