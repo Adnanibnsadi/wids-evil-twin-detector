@@ -192,22 +192,44 @@ This should help determine whether machine learning provides a measurable improv
 
 ## Timing & VMware Considerations
 
-Development and testing were performed primarily using:
+One of the challenges I encountered during development was obtaining reliable timing measurements from Wi-Fi beacon frames.
 
-- Kali Linux
-- VMware
-- External USB Wi-Fi adapter
-- Monitor mode
+Most of my testing was performed using Kali Linux inside VMware, with an external USB Wi-Fi adapter operating in monitor mode.
 
-Virtualization and USB scheduling introduce timing noise.
+### The Problem
 
-Channel hopping can also create large gaps between consecutive captured beacons, which initially produced unreliable clock-skew measurements.
+The detector uses beacon timestamps and the intervals between observations to identify unusual timing behavior.
 
-To reduce these false alerts, clock-skew evidence is only trusted when consecutive beacon observations fall within a limited timing window.
+However, several factors can affect these measurements:
 
-This timing filter significantly improved benign monitoring stability in the development environment.
+- **Channel hopping:** The adapter may miss beacons while monitoring other channels.
+- **USB and VMware scheduling:** Delays can affect when captured packets reach the monitoring application.
+- **Packet loss:** Missing frames can create unexpectedly large gaps between observations.
+- **Receiver and driver behaviour:** Local processing delays can introduce additional measurement noise.
 
----
+During initial testing, some legitimate access points produced suspicious timing readings even when no attack was being performed.
+
+### How I Addressed It
+
+I introduced a timing filter that limits when clock-skew evidence is considered reliable.
+
+The detector uses timing evidence only when consecutive captured beacon observations fall within a defined time window. Observations separated by larger gaps are not treated as equally reliable for clock-skew analysis.
+
+This reduced the influence of channel-hopping gaps and timing noise during my development tests.
+
+### What I Learned
+
+These experiments showed me that unusual timing measurements do not necessarily indicate malicious activity.
+
+The monitoring environment itself can influence the observations, especially when wireless capture is performed through a virtual machine.
+
+For this reason, timing anomalies are treated as supporting evidence rather than proof of transmitter impersonation.
+
+### Remaining Work
+
+I still need to evaluate how consistently this filtering approach performs across different Wi-Fi adapters, capture sessions, and monitoring environments.
+
+A useful next experiment would compare timing measurements collected inside VMware with those collected directly on Linux hardware under similar conditions.
 
 ## Alert Logic
 
