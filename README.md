@@ -233,20 +233,43 @@ A useful next experiment would compare timing measurements collected inside VMwa
 
 ## Alert Logic
 
-The detector does not alert on every isolated anomaly.
+The detector does not generate an alert whenever it encounters an unusual beacon frame.
 
-The current design uses:
+During development, I found that individual measurements can be affected by packet loss, channel hopping, or changes in normal access-point behavior. To reduce unnecessary alerts, the system combines several indicators and checks whether suspicious observations persist.
 
-- Strong and supporting evidence
-- Aggregated suspicion scoring
-- A minimum suspicious-frame streak
-- Per-BSSID alert cooldowns
+### 1. Evidence Scoring
 
-This helps prevent individual noisy measurements from immediately creating alerts.
+The detector evaluates indicators such as sequence-number inconsistencies, beacon-structure deviations, security-configuration changes, timing anomalies, and machine-learning results.
 
-The current implementation requires multiple consecutive suspicious observations before generating an alert.
+These indicators contribute to a combined suspicion score using predefined weights.
 
----
+The score represents the strength of the observed evidence. It is not a statistically calibrated probability of an attack.
+
+### 2. Suspicious Observation Streak
+
+A suspicious score from a single observation is not normally sufficient to generate an alert.
+
+The detector tracks consecutive suspicious observations and uses a configurable streak threshold before triggering an alert.
+
+This helps prevent isolated anomalies from immediately being reported as security incidents.
+
+### 3. Per-BSSID Alert Cooldown
+
+After an alert is generated, a cooldown mechanism limits repeated alerts associated with the same BSSID.
+
+This reduces repetitive notifications when suspicious observations continue over a short period.
+
+### 4. Alert Interpretation
+
+An alert indicates that the observed beacon behaviour differs from the expected access-point profile or contains other suspicious characteristics.
+
+It does not independently confirm an Evil Twin attack or identify the physical device responsible.
+
+### Current Limitations
+
+The scoring weights, thresholds, and cooldown settings are part of the current prototype configuration.
+
+Further testing is needed to determine how these settings affect detection sensitivity, false alerts, and detection latency across different wireless environments.
 
 ## Demonstrated Lab Results
 
