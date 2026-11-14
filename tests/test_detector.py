@@ -287,36 +287,36 @@ def test_unknown_unprofiled_ap_is_ignored():
     assert threat_score == 0.0
 
 
-def test_known_ssid_from_different_bssid_is_suspicious():
-    """
-    A profiled SSID appearing from a different BSSID is
-    strong evidence in the current prototype.
-    """
-
+def test_unknown_bssid_with_known_ssid_is_not_automatically_flagged():
+    """An unprofiled BSSID is not proof of impersonation."""
     install_baseline_profile()
 
-    feature = make_feature(
-        bssid=ROGUE_BSSID,
+    suspicious, reasons, score = detector.evaluate_packet(
+        make_feature(bssid=ROGUE_BSSID)
     )
 
-    (
-        is_suspicious,
-        reasons,
-        threat_score,
-    ) = detector.evaluate_packet(
-        feature
+    assert suspicious is False
+    assert reasons == []
+    assert score == 0.0
+
+
+def test_two_authorized_aps_can_share_an_ssid():
+    """Each profiled BSSID uses its own baseline."""
+    install_baseline_profile()
+
+    second_bssid = "02:10:00:00:00:02"
+    detector.bssid_profiles[second_bssid] = {
+        **detector.bssid_profiles[PROFILE_BSSID],
+        "bssid": second_bssid,
+    }
+
+    suspicious, reasons, score = detector.evaluate_packet(
+        make_feature(bssid=second_bssid)
     )
 
-    assert is_suspicious is True
-    assert threat_score == pytest.approx(
-        0.85
-    )
-
-    assert any(
-        "SSID/BSSID inconsistency"
-        in reason
-        for reason in reasons
-    )
+    assert suspicious is False
+    assert reasons == []
+    assert score == 0.0
 
 
 def test_duplicate_sequence_activity_is_suspicious():
@@ -629,7 +629,6 @@ def test_threat_score_is_capped_at_one():
     install_baseline_profile()
 
     feature = make_feature(
-        bssid=ROGUE_BSSID,
         is_seq_duplicate=1,
         ie_count=24,
         security="Open",

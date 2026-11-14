@@ -618,59 +618,15 @@ def evaluate_packet(feat):
         "bssid"
     ]
 
-    ssid = feat[
-        "ssid"
-    ]
+    # Only compare observations against the profile for their
+    # exact BSSID. A shared SSID is common in legitimate multi-AP
+    # networks and does not establish that two radios are the same AP.
+    matched_profile = bssid_profiles.get(bssid)
 
-    matched_profile = None
-    target_bssid = None
-
-
-    # ── PROFILE LOOKUP ────────────────────────────────
-
-    if bssid in bssid_profiles:
-
-        matched_profile = (
-            bssid_profiles[bssid]
-        )
-
-        target_bssid = bssid
-
-    else:
-
-        # Search for an already-profiled AP advertising
-        # the same SSID from a different BSSID.
-        for (
-            profiled_bssid,
-            profile,
-        ) in bssid_profiles.items():
-
-            if (
-                profile["ssid"].lower()
-                == ssid.lower()
-                and ssid != "<Hidden>"
-            ):
-
-                matched_profile = (
-                    profile
-                )
-
-                target_bssid = (
-                    profiled_bssid
-                )
-
-                break
-
-
-    # Ignore APs that are not represented in the
-    # current baseline.
-    if not matched_profile:
-
-        return (
-            False,
-            [],
-            0.0,
-        )
+    # An unknown BSSID needs a separate discovery/authorization
+    # workflow. Do not compare it with an arbitrary AP sharing its SSID.
+    if matched_profile is None:
+        return False, [], 0.0
 
 
     evidence_reasons = []
@@ -701,24 +657,6 @@ def evaluate_packet(feat):
             "was observed again for the same "
             "BSSID within the configured "
             "short timing window."
-        )
-
-
-    # ── STRONG EVIDENCE 2:
-    # KNOWN SSID FROM DIFFERENT BSSID
-    # ─────────────────────────────────────────────────
-
-    if bssid != target_bssid:
-
-        threat_score += 0.85
-
-        strong_evidence_count += 1
-
-        evidence_reasons.append(
-            "SSID/BSSID inconsistency: "
-            f"known SSID '{ssid}' observed from "
-            f"{bssid}; profiled BSSID is "
-            f"{target_bssid}."
         )
 
 
@@ -875,18 +813,18 @@ def evaluate_packet(feat):
     )
 
     if (
-        target_bssid in models
-        and target_bssid in scalers
+        bssid in models
+        and bssid in scalers
         and features_order
         and feat["valid_skew"]
     ):
 
         model = models[
-            target_bssid
+            bssid
         ]
 
         scaler = scalers[
-            target_bssid
+            bssid
         ]
 
         raw_features = np.array(
