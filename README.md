@@ -273,50 +273,77 @@ Further testing is needed to determine how these settings affect detection sensi
 
 ## Demonstrated Lab Results
 
-The following results were obtained during controlled development experiments.
+The following observations were recorded during local development and controlled laboratory testing.
 
-### Multi-AP Baseline Dataset
+These are preliminary experimental results, not a comprehensive evaluation of detection accuracy.
 
-A local benign capture contained approximately:
+### 1. Multi-AP Baseline Collection
 
-- **9,500 beacon observations**
-- **15 unique BSSIDs**
-- approximately **20 minutes of monitoring**
+During baseline collection, I recorded approximately:
 
-Twelve AP profiles were generated after excluding very low-observation BSSIDs.
+- 9,500 beacon observations
+- 15 unique BSSIDs
+- 20 minutes of monitoring
 
-> The original neighborhood capture is not included in the public repository because it contains real wireless-network identifiers.
+After filtering access points with insufficient observations, 12 AP profiles were generated.
 
----
+These profiles were used to establish reference characteristics for subsequent detection experiments.
 
-### Benign Monitoring
+The original capture data is not publicly distributed because it contains information about nearby wireless networks.
 
-After timing-jitter calibration:
+### 2. Benign Monitoring
 
-> **No false alerts were observed across more than 1,300 beacon frames during a controlled benign monitoring session.**
+After adjusting the timing filter to reduce capture-related noise, I monitored more than 1,300 beacon observations during a controlled benign session.
 
-This is an observed baseline result and **should not be interpreted as a formally established 0% false-positive rate**.
+No alerts were observed during that session.
 
-Broader multi-session evaluation is planned.
+This is a limited experimental observation. It should not be interpreted as a validated 0% false-positive rate.
 
----
+Additional independent sessions are needed to evaluate how the detector behaves under different network conditions.
 
-### Controlled BSSID-Spoofing Experiment
+### 3. Controlled BSSID-Spoofing Experiment
 
-A controlled laboratory Evil Twin simulation advertising the same BSSID as a profiled AP triggered the detector.
+I tested the detector using a laboratory transmitter configured to advertise the same BSSID as an access point in the baseline.
 
-Observed evidence included combinations of:
+The detector generated an alert during this experiment.
 
-- Duplicate sequence activity
-- Beacon Information Element differences
-- Security configuration differences
-- Timing / clock-skew anomalies
-- ML anomaly evidence
+The observed suspicious indicators included combinations of:
 
-The experiment demonstrates detection of a **BSSID-spoofed laboratory transmitter**, but the current injector is not a full high-fidelity clone of every beacon field emitted by the legitimate access point.
+- Duplicate sequence-number activity
+- Beacon Information Element count differences
+- Advertised security-configuration differences
+- Timing deviations
+- Machine-learning anomaly evidence
 
----
+The experiment demonstrates that the prototype can identify the tested spoofing scenario.
 
+However, the simulated transmitter did not reproduce every characteristic of the legitimate access point. This result therefore does not establish reliable detection of highly sophisticated or perfectly cloned Evil Twin attacks.
+
+### 4. Evaluation Limitations
+
+The current experiments are limited by:
+
+- A relatively small number of monitoring sessions
+- A single primary development environment
+- Limited attack scenarios
+- Wireless timing noise and packet loss
+- Lack of an independently evaluated test dataset
+
+The raw development captures and complete experimental logs are not currently available in this public repository.
+
+### 5. Next Evaluation Goals
+
+I plan to expand testing using separate benign and attack sessions.
+
+Future evaluation will focus on:
+
+- Detection rate across different spoofing scenarios
+- False alerts during independent benign sessions
+- Detection latency
+- Performance with multiple legitimate APs sharing an SSID
+- The contribution of each detection method through ablation testing
+
+My goal is to understand which indicators provide reliable evidence under realistic wireless conditions, rather than relying on isolated successful demonstrations.
 ## Visualizations
 
 The project includes a chart-generation script for analyzing locally collected wireless data.
